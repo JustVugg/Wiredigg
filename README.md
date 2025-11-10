@@ -15,7 +15,7 @@ Designed for network administrators, security professionals, and IT enthusiasts,
 ## **Key Features**
 
 ### **AI & Machine Learning Integration**
-- **OllamaValidator**: Leverages advanced AI to validate ML-detected anomalies and reduce false positives.
+- **Ollama Support**: Leverages advanced AI (using GPT-120B Cloud via Ollama, my preferred model, though others perform excellently as well) to validate ML-detected anomalies and reduce false positives.
 - **Incremental ML Training**: Continuously improves anomaly detection accuracy with user feedback.
 - **Threat Classification**: Automatically classifies threats based on severity and type.
 - **False Positive Management**: Mark and retrain the ML model to refine detection.
