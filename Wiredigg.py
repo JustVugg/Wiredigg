@@ -17,6 +17,187 @@ import traceback
 from ctypes import windll
 from add_ico_hook import resource_path
 
+import requests
+import json
+
+class OllamaValidator:
+    """Classe per validare le anomalie ML usando Ollama"""
+    
+    def __init__(self, model_name="gpt-oss:120b-cloud", ollama_url="http://localhost:11434"):
+        self.model_name = model_name
+        self.ollama_url = ollama_url
+        self.api_endpoint = f"{ollama_url}/api/generate"
+        
+    def check_connection(self):
+        """Verifica se Ollama è disponibile"""
+        try:
+            response = requests.get(f"{self.ollama_url}/api/tags")
+            return response.status_code == 200
+        except:
+            return False
+    
+    def analyze_packet(self, packet_data, ml_score, anomaly_type):
+        """Analizza un pacchetto con Ollama per confermare l'anomalia ML"""
+        
+        # Prepara il prompt per Ollama
+        prompt = f"""<role>
+    You are AEGIS-7, an advanced AI security analyst with deep expertise in:
+    - Network protocol analysis (TCP/IP, UDP, ICMP, ARP, DNS, HTTP/S, etc.)
+    - Threat detection and incident response
+    - Distinguishing between legitimate traffic and actual threats
+    - Understanding of common false positives in ML-based detection systems
+    </role>
+
+    <context>
+    An ML anomaly detection system flagged this packet. ML systems often have high false positive rates, especially with:
+    - Multicast/broadcast traffic (mDNS, SSDP, LLMNR)
+    - Local network discovery protocols
+    - Legitimate but uncommon traffic patterns
+    - Normal system background traffic
+
+    Your task is to perform deep analysis and determine if this is a REAL threat or a false positive.
+    </context>
+
+    <ml_detection>
+    ML Anomaly Score: {ml_score:.1f}%
+    ML Classification: {anomaly_type}
+    </ml_detection>
+
+    <packet_analysis>
+    Source IP: {packet_data.get('src', 'Unknown')}
+    Destination IP: {packet_data.get('dst', 'Unknown')}
+    Protocol: {packet_data.get('proto_name', 'Unknown')}
+    Source Port: {packet_data.get('sport', 'N/A')}
+    Destination Port: {packet_data.get('dport', 'N/A')}
+    Packet Size: {packet_data.get('len', 0)} bytes
+    Timestamp: {packet_data.get('time', 'Unknown')}
+    </packet_analysis>
+
+    <analysis_framework>
+    Step 1 - PROTOCOL VALIDATION:
+    - Is this standard protocol behavior?
+    - Common ports: 80/443 (web), 22 (SSH), 53 (DNS), 5353 (mDNS), 1900 (SSDP)
+    - Multicast ranges: 224.0.0.0/4 (often legitimate)
+
+    Step 2 - THREAT INDICATORS:
+    - Unusual port combinations
+    - Known malware signatures
+    - Data exfiltration patterns
+    - Command & control behaviors
+    - Scanning/reconnaissance patterns
+
+    Step 3 - FALSE POSITIVE INDICATORS:
+    - mDNS (224.0.0.251:5353) = Apple Bonjour/Avahi discovery
+    - SSDP (239.255.255.250:1900) = UPnP discovery
+    - LLMNR (224.0.0.252:5355) = Windows name resolution
+    - DHCP (67/68) = Network configuration
+    - ARP = Address resolution (always legitimate in local networks)
+    - Local broadcasts = Often legitimate
+
+    Step 4 - CONTEXTUAL ANALYSIS:
+    - Is source IP local (192.168.x.x, 10.x.x.x, 172.16-31.x.x)?
+    - Is this common background traffic?
+    - Does the port match the expected service?
+    - Is the packet size reasonable for the protocol?
+
+    Step 5 - RISK ASSESSMENT:
+    Consider the actual risk if this were malicious vs. the operational impact of false positives.
+    </analysis_framework>
+
+    <decision_criteria>
+    Mark as threat ONLY if you find:
+    1. Clear indicators of malicious activity
+    2. Known attack patterns
+    3. Suspicious data exfiltration
+    4. Unauthorized access attempts
+    5. Malware communication patterns
+
+    DO NOT mark as threat if:
+    1. It's normal network discovery (mDNS, SSDP, etc.)
+    2. Standard service on expected ports
+    3. Local network management traffic
+    4. Common false positive patterns
+    </decision_criteria>
+
+    <instructions>
+    Analyze systematically through all 5 steps. Be conservative - only flag REAL threats.
+    Many packets flagged by ML are legitimate traffic. Your expertise is crucial to reduce false positives.
+
+    Output your analysis as JSON:
+    {{"is_threat": true/false, "confidence": 0-100, "explanation": "concise explanation (max 50 words)"}}
+
+    Remember: 
+    - mDNS/Bonjour (224.0.0.251) is NOT a threat
+    - SSDP/UPnP (239.255.255.250) is NOT a threat  
+    - Most multicast is legitimate
+    - High ML scores don't always mean real threats
+    </instructions>"""
+        
+        try:
+            response = requests.post(
+                self.api_endpoint,
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json"
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                response_text = result.get('response', '{}')
+                
+                # Parse JSON response from Ollama
+                try:
+                    analysis = json.loads(response_text)
+                    return {
+                        'success': True,
+                        'is_threat': analysis.get('is_threat', False),
+                        'confidence': analysis.get('confidence', 0),
+                        'explanation': analysis.get('explanation', 'No explanation provided'),
+                        'raw_response': response_text
+                    }
+                except json.JSONDecodeError:
+                    # Se Ollama non risponde in JSON, proviamo a interpretare
+                    return self._parse_text_response(response_text)
+            else:
+                return {
+                    'success': False,
+                    'error': f"Ollama returned status code: {response.status_code}"
+                }
+                
+        except requests.exceptions.Timeout:
+            return {
+                'success': False,
+                'error': "Ollama request timed out"
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _parse_text_response(self, text):
+        """Fallback parser per risposte non-JSON"""
+        text_lower = text.lower()
+        is_threat = 'yes' in text_lower or 'threat' in text_lower or 'malicious' in text_lower
+        
+        # Cerca di estrarre una percentuale
+        import re
+        confidence_match = re.search(r'(\d+)%', text)
+        confidence = int(confidence_match.group(1)) if confidence_match else (80 if is_threat else 20)
+        
+        return {
+            'success': True,
+            'is_threat': is_threat,
+            'confidence': confidence,
+            'explanation': text[:200] if len(text) > 200 else text,
+            'raw_response': text
+        }
+
+'''
 import ctypes
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -25,7 +206,7 @@ except:
         ctypes.windll.user32.SetProcessDPIAware()
     except:
         pass
-
+'''
 ico_path = resource_path("wiredigg.ico")
 
 
@@ -53,7 +234,36 @@ class NetworkAnalyzer:
         self.style.configure("TNotebook", background="#2e3440", foreground="#eceff4")
         self.style.configure("TNotebook.Tab", background="#3b4252", foreground="#eceff4")
         self.style.configure("TCheckbutton", background="#2e3440", foreground="#eceff4")
-        
+        self.style.configure("Treeview", 
+    background="white",
+    foreground="black",
+    fieldbackground="white",
+    borderwidth=0
+)
+        self.style.map("Treeview",
+    background=[("selected", "#0078d7"), ("active", "white")],  # active = white removes hover
+    foreground=[("selected", "white"), ("active", "black")]      # active = black keeps text black
+)
+
+        # Configura anche le intestazioni per non cambiare colore
+        self.style.map("Treeview.Heading",
+    background=[
+        ("active", "#c0c0c0"),    # Più scuro quando ci passi sopra
+        ("pressed", "#b0b0b0")    # Ancora più scuro quando cliccato
+    ],
+    foreground=[
+        ("active", "black"),    # Più scuro quando ci passi sopra
+        ("pressed", "black")    # Ancora più scuro quando cliccato
+    ],
+    relief=[
+        ("pressed", "sunken")     # Effetto affondato quando cliccato
+    ]
+)
+
+        self.style.map("Treeview.Heading",
+            background=[("active", "#e0e0e0")],  # Same color when hovering
+            relief=[("active", "flat")]
+        )
         # Mapping to keep text visible in all states
 
         self.style.map("TButton",
@@ -258,6 +468,8 @@ class NetworkAnalyzer:
         packet_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.setup_virtual_treeview.configure(yscrollcommand=packet_scrollbar.set)
 
+        self.setup_column_sorting()
+
         # Package details frame
 
         self.packet_details_frame = ttk.Frame(packets_frame)
@@ -353,6 +565,7 @@ class NetworkAnalyzer:
             self.threat_tree.column(col, width=width)
 
         # Vertical scrollbar
+        self.setup_threat_column_sorting()
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.threat_tree.yview)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -424,7 +637,154 @@ class NetworkAnalyzer:
         self.status_bar = ttk.Label(self.root, text="Wiredigg Ready - Select an Interface and Start Capturing", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
+    def setup_threat_column_sorting(self):
+        """Setup sorting for threat table columns"""
+        # Store sort direction for each column
+        if not hasattr(self, 'threat_sort_directions'):
+            self.threat_sort_directions = {}
+        
+        for col in ("Timestamp", "Source", "Destination", "Threat type", "Severity", "Description"):
+            self.threat_sort_directions[col] = False  # False = ascending, True = descending
+            
+            # Bind click on column header
+            self.threat_tree.heading(col, 
+                command=lambda c=col: self.sort_threat_column(c))
 
+    def sort_threat_column(self, col):
+        """Sort threat tree by column"""
+        # Get all items
+        items = [(self.threat_tree.set(item, col), item) 
+                for item in self.threat_tree.get_children('')]
+        
+        # Determine sort key based on column
+        if col == "Timestamp":
+            # Time sort - convert to sortable format
+            try:
+                items = [(self.convert_time_to_sortable(val), item) for val, item in items]
+            except:
+                pass  # Fall back to string sort
+        elif col == "Severity":
+            # Severity sort - custom order
+            severity_order = {"High": 3, "Medium": 2, "Low": 1, "Safe": 0}
+            items = [(severity_order.get(val, -1), item) for val, item in items]
+        elif col in ["Source", "Destination"]:
+            # IP address sort
+            def ip_sort_key(ip_str):
+                try:
+                    # Try to parse as IPv4
+                    parts = ip_str.split('.')
+                    if len(parts) == 4:
+                        return tuple(int(part) for part in parts)
+                except:
+                    pass
+                # Fall back to string sort
+                return (999, 999, 999, 999, ip_str)
+            
+            items = [(ip_sort_key(val), item) for val, item in items]
+        
+        # Sort items
+        items.sort(reverse=self.threat_sort_directions[col])
+        
+        # Rearrange items in treeview
+        for index, (val, item) in enumerate(items):
+            self.threat_tree.move(item, '', index)
+        
+        # Toggle sort direction
+        self.threat_sort_directions[col] = not self.threat_sort_directions[col]
+        
+        # Update all column headers
+        for c in self.threat_sort_directions:
+            if c == col:
+                # Show arrow for sorted column
+                if self.threat_sort_directions[c]:
+                    self.threat_tree.heading(c, text=f"{c} ▼")
+                else:
+                    self.threat_tree.heading(c, text=f"{c} ▲")
+            else:
+                # Remove arrow from other columns
+                self.threat_tree.heading(c, text=c)
+
+    def convert_time_to_sortable(self, time_str):
+        """Convert time string to sortable format"""
+        try:
+            # Assuming format like "14:30:25"
+            parts = time_str.split(':')
+            if len(parts) == 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = int(parts[2])
+                return hours * 3600 + minutes * 60 + seconds
+        except:
+            pass
+        return time_str
+
+    def setup_column_sorting(self):
+        """Setup sorting for packet table columns"""
+        # Store sort direction for each column
+        self.sort_directions = {}
+        
+        for col in ("No.", "Time", "Source", "Destination", "Protocol", "Length", "Information"):
+            self.sort_directions[col] = False  # False = ascending, True = descending
+            
+            # Bind click on column header
+            self.setup_virtual_treeview.heading(col, 
+                command=lambda c=col: self.sort_treeview_column(c))
+
+    def sort_treeview_column(self, col):
+        """Sort treeview by column with improved IP sorting"""
+        # Get all items
+        items = [(self.setup_virtual_treeview.set(item, col), item) 
+                for item in self.setup_virtual_treeview.get_children('')]
+        
+        # Determine sort key based on column
+        if col == "No." or col == "Length":
+            # Numeric sort
+            try:
+                items = [(int(val) if val else 0, item) for val, item in items]
+            except ValueError:
+                pass
+        elif col == "Time":
+            # Time sort
+            try:
+                items = [(float(val) if val else 0.0, item) for val, item in items]
+            except ValueError:
+                pass
+        elif col in ["Source", "Destination"]:
+            # IP address sort
+            def ip_sort_key(ip_str):
+                try:
+                    # Try to parse as IPv4
+                    parts = ip_str.split('.')
+                    if len(parts) == 4:
+                        return tuple(int(part) for part in parts)
+                except:
+                    pass
+                # Fall back to string sort
+                return (999, 999, 999, 999, ip_str)
+            
+            items = [(ip_sort_key(val), item) for val, item in items]
+        
+        # Sort items
+        items.sort(reverse=self.sort_directions[col])
+        
+        # Rearrange items in treeview
+        for index, (val, item) in enumerate(items):
+            self.setup_virtual_treeview.move(item, '', index)
+        
+        # Toggle sort direction
+        self.sort_directions[col] = not self.sort_directions[col]
+        
+        # Update all column headers
+        for c in self.sort_directions:
+            if c == col:
+                # Show arrow for sorted column
+                if self.sort_directions[c]:
+                    self.setup_virtual_treeview.heading(c, text=f"{c} ▼")
+                else:
+                    self.setup_virtual_treeview.heading(c, text=f"{c} ▲")
+            else:
+                # Remove arrow from other columns
+                self.setup_virtual_treeview.heading(c, text=c)
 
     def initialize_ml_model(self):
         """Initialize the machine learning model with incremental support"""
@@ -711,35 +1071,49 @@ class NetworkAnalyzer:
         return False
 
     def setup_virtual_treeview(self):
-        """Set up a virtual Treeview that loads only visible items"""        
-        # Create the standard Treeview
-
-        self.setup_virtual_treeview = ttk.Treeview(self.packets_frame, columns=self.packet_columns, show="headings")
+        """Set up a virtual Treeview that loads only visible items"""
+        # Create a custom style
+        style = ttk.Style()
+        style.configure("Custom.Treeview",
+                        background="#ffffff",     # Sfondo bianco
+                        foreground="#000000",     # Testo nero
+                        rowheight=25,             # Altezza righe
+                        fieldbackground="#ffffff")
+        
+        # Colore quando si seleziona una riga
+        style.map("Custom.Treeview",
+                background=[('selected', '#4a6984')],  # Blu scuro quando selezionato
+                foreground=[('selected', '#ffffff')])  # Testo bianco quando selezionato
+        
+        # Create the Treeview with custom style
+        self.setup_virtual_treeview = ttk.Treeview(self.packets_frame, 
+                                                columns=self.packet_columns, 
+                                                show="headings",
+                                                style="Custom.Treeview")
+        
+        # Configurazione colori delle intestazioni (opzionale)
+        style.configure("Custom.Treeview.Heading",
+                        background="#e0e0e0",     # Grigio chiaro per le intestazioni
+                        foreground="#000000",     # Testo nero
+                        relief="flat")
         
         # Create a separate data structure to store all the packets
-
         if not hasattr(self, 'all_packets'):
             self.all_packets = []  # Store all package data here
-
         
         # Configure scrolling events
-
         vsb = ttk.Scrollbar(self.packets_frame, orient="vertical", command=self.on_treeview_scroll)
         self.setup_virtual_treeview.configure(yscrollcommand=vsb.set)
         vsb.pack(side='right', fill='y')
         self.setup_virtual_treeview.pack(expand=True, fill='both')
         
         # Also configure the window resize event
-
         self.root.bind("<Configure>", lambda e: self.after(100, self.update_visible_items))
         
         # Number of items to display (buffer)
-
         self.visible_buffer = 100  # Visible elements + buffers above and below
-
         
         # Configure the scroll event handler
-
         self.setup_virtual_treeview.bind("<<TreeviewSelect>>", self.on_packet_select)
 
     def on_treeview_scroll(self, *args):
@@ -2561,63 +2935,474 @@ class NetworkAnalyzer:
             # Payload (it appears)
 
             if 'payload' in packet:
-                payload_id = self.packet_details.insert(udp_id, tk.END, text="Payload", open=True)
+                payload_id = self.packet_details.insert(udp_id, tk.END, open=True)
                 self.display_hex_payload(payload_id, packet['payload'])
 
 
-    def display_hex_payload(self, parent_id, payload_data):
-        """View payload in hexadecimal and ASCII format"""
-        if not payload_data:
+    def display_hex_payload(self, parent_id, payload):
+        """Display hex dump with protocol field highlighting"""
+        if not payload:
             return
-            
-        # Limit the 512 byte display for performance
-
-        display_limit = min(512, len(payload_data))
         
-        # Create a main knot for payload
-
-        payload_parent = self.packet_details.insert(parent_id, tk.END, text="Payload Hex Dump", open=True)
+        # Initialize field_mappings
+        if not hasattr(self, 'field_mappings'):
+            self.field_mappings = {}
         
-        # Add header
-
-        header_id = self.packet_details.insert(payload_parent, tk.END, 
-                                            text="Offset    00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F    ASCII")
+        # Store payload for copy operations
+        self.current_payload = payload
         
-        # Add separator
-
-        self.packet_details.insert(payload_parent, tk.END, 
-                                text="-------------------------------------------------------------------")
+        # Rest of the function remains the same...
+        # Create Text widget for the actual hex display if it doesn't exist
+        if not hasattr(self, 'hex_text'):
+            self.hex_text = tk.Text(self.packet_details_frame, 
+                                height=10, 
+                                font=("Courier", 10),
+                                wrap="none",
+                                cursor="arrow",
+                                bg="white",  # White background
+                                fg="black")  # Black text
+            self.hex_text.pack(side="bottom", fill="both", expand=True)
+            
+            # Create right-click context menu (Wireshark-style)
+            self.hex_context_menu = tk.Menu(self.hex_text, tearoff=0)
+            self.hex_context_menu.add_command(label="Copy Bytes (Hex Stream)", command=lambda: self.copy_bytes_hex_stream())
+            self.hex_context_menu.add_command(label="Copy Bytes (Offset Hex)", command=lambda: self.copy_bytes_offset_hex())
+            self.hex_context_menu.add_command(label="Copy Bytes (Printable Text)", command=lambda: self.copy_bytes_printable())
+            self.hex_context_menu.add_separator()
+            self.hex_context_menu.add_command(label="Copy as C Array", command=lambda: self.copy_as_c_array())
+            self.hex_context_menu.add_command(label="Copy as Python List", command=lambda: self.copy_as_python_list())
+            self.hex_context_menu.add_separator()
+            self.hex_context_menu.add_command(label="Save as Binary...", command=lambda: self.save_as_binary())
+            
+            # Bind right-click
+            self.hex_text.bind("<Button-3>", self.show_hex_context_menu)
+            
+            # Disable text selection
+            self.hex_text.bind("<Button-1>", lambda e: "break")
+            self.hex_text.bind("<B1-Motion>", lambda e: "break")
+            self.hex_text.bind("<Double-Button-1>", lambda e: "break")
+            self.hex_text.bind("<Triple-Button-1>", lambda e: "break")
+            self.hex_text.bind("<Control-a>", lambda e: "break")
+            self.hex_text.bind("<Control-c>", lambda e: "break")
+            self.hex_text.bind("<Key>", lambda e: "break")
         
-        offset = 0
-        while offset < display_limit:
-            # Take 16 bytes at a time
+        self.hex_text.config(state="normal")
+        self.hex_text.delete("1.0", "end")
+        
+        # Auto-detect protocol fields
+        fields = self.detect_protocol_fields(payload)
+        
+        # Build hex dump
+        for i in range(0, len(payload), 16):
+            chunk = payload[i:i+16]
+            offset = f"{i:04x}"
+            
+            hex_parts = []
+            ascii_chars = []
+            
+            for byte in chunk:
+                hex_parts.append(f"{byte:02x}")
+                if 32 <= byte <= 126:
+                    ascii_chars.append(chr(byte))
+                else:
+                    ascii_chars.append('.')
+            
+            while len(hex_parts) < 16:
+                hex_parts.append('  ')
+                ascii_chars.append(' ')
+            
+            hex_str = ' '.join(hex_parts[:8]) + '  ' + ' '.join(hex_parts[8:])
+            ascii_str = ''.join(ascii_chars)
+            
+            line = f"{offset}  {hex_str}  {ascii_str}\n"
+            self.hex_text.insert("end", line)
+        
+        # Apply field highlighting
+        for field in fields:
+            self.apply_field_highlighting(field, payload)
+        
+        # Bind hover events
+        self.hex_text.bind("<Motion>", self.on_payload_hover)
+        self.hex_text.bind("<Leave>", self.on_payload_leave)
+        
+        self.hex_text.config(state="disabled")
 
-            chunk = payload_data[offset:offset+16]
-            
-            # Format the Hex values
+    def on_payload_hover(self, event):
+        """Handle hover on hex text with debouncing"""
+        if not hasattr(self, 'hex_text'):
+            return
+        
+        # Cancel previous hover timer if exists
+        if hasattr(self, '_hover_timer'):
+            self.root.after_cancel(self._hover_timer)
+        
+        # Set a small delay to avoid flickering
+        self._hover_timer = self.root.after(50, lambda: self._process_hover(event))
 
-            hex_values = ' '.join(f'{b:02x}' for b in chunk).ljust(47)
-            
-            # Converts into printed ASCII characters
+    def _process_hover(self, event):
+        """Process hover after debounce delay"""
+        try:
+            # Get position under mouse
+            mouse_index = self.hex_text.index(f"@{event.x},{event.y}")
+            tags = self.hex_text.tag_names(mouse_index)
+        except:
+            return  # Mouse might have moved outside
+        
+        # Find field tag
+        field_found = False
+        for tag in tags:
+            if tag.startswith("field_") and tag in self.field_mappings:
+                # Check if it's a different field
+                if not hasattr(self, 'current_highlight_tag') or self.current_highlight_tag != tag:
+                    # Clear previous highlight
+                    if hasattr(self, 'current_highlight_tag') and self.current_highlight_tag:
+                        if self.current_highlight_tag in self.field_mappings:
+                            self.hex_text.tag_configure(self.current_highlight_tag,
+                                                    background="",
+                                                    foreground="")
+                    
+                    # Apply new highlight
+                    field = self.field_mappings[tag]
+                    self.hex_text.tag_configure(tag, 
+                                            background="#3399ff",
+                                            foreground="white")
+                    
+                    self.show_field_tooltip(event, field)
+                    self.current_highlight_tag = tag
+                
+                field_found = True
+                self.hex_text.config(cursor="hand2")
+                break
+        
+        if not field_found and hasattr(self, 'current_highlight_tag'):
+            self.clear_field_highlight()
+            self.hex_text.config(cursor="arrow")
 
-            ascii_values = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
-            
-            # L'OFFSET in format
+    # Context menu functions
+    def show_hex_context_menu(self, event):
+        """Show right-click context menu"""
+        # Initialize field_mappings if not exists
+        if not hasattr(self, 'field_mappings'):
+            self.field_mappings = {}
+        
+        # Store click position for context-sensitive operations
+        self.context_click_index = self.hex_text.index(f"@{event.x},{event.y}")
+        
+        # Update menu based on what's under cursor
+        tags = self.hex_text.tag_names(self.context_click_index)
+        field_name = None
+        for tag in tags:
+            if tag.startswith("field_") and tag in self.field_mappings:
+                field = self.field_mappings[tag]
+                field_name = field['name']
+                break
+        
+        # Update menu label if on a field
+        if field_name:
+            self.hex_context_menu.entryconfig(0, label=f"Copy {field_name} Bytes (Hex Stream)")
+        else:
+            self.hex_context_menu.entryconfig(0, label="Copy Bytes (Hex Stream)")
+        
+        try:
+            self.hex_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.hex_context_menu.grab_release()
 
-            offset_text = f"0x{offset:04x}"
-            
-            # Insert the complete line
+    def copy_bytes_hex_stream(self):
+        """Copy as continuous hex stream"""
+        if hasattr(self, 'current_payload'):
+            hex_stream = ''.join(f"{byte:02x}" for byte in self.current_payload)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(hex_stream)
 
-            row_text = f"{offset_text}    {hex_values}    {ascii_values}"
-            self.packet_details.insert(payload_parent, tk.END, text=row_text)
+    def copy_bytes_offset_hex(self):
+        """Copy with offset and hex (like Wireshark display)"""
+        if hasattr(self, 'current_payload'):
+            lines = []
+            for i in range(0, len(self.current_payload), 16):
+                chunk = self.current_payload[i:i+16]
+                offset = f"{i:04x}"
+                hex_str = ' '.join(f"{byte:02x}" for byte in chunk)
+                lines.append(f"{offset}  {hex_str}")
             
-            offset += 16
+            self.root.clipboard_clear()
+            self.root.clipboard_append('\n'.join(lines))
+
+    def copy_bytes_printable(self):
+        """Copy only printable text"""
+        if hasattr(self, 'current_payload'):
+            printable = ''.join(chr(byte) if 32 <= byte <= 126 else '.' 
+                            for byte in self.current_payload)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(printable)
+
+    def copy_as_c_array(self):
+        """Copy as C array"""
+        if hasattr(self, 'current_payload'):
+            c_array = "unsigned char packet[] = {\n    "
+            hex_bytes = [f"0x{byte:02x}" for byte in self.current_payload]
             
-        if len(payload_data) > display_limit:
-            self.packet_details.insert(payload_parent, tk.END, 
-                                    text="-------------------------------------------------------------------")
-            self.packet_details.insert(payload_parent, tk.END, 
-                    text=f"... {len(payload_data) - display_limit} additional bytes not displayed")
+            # Format in rows of 8 bytes
+            for i in range(0, len(hex_bytes), 8):
+                c_array += ', '.join(hex_bytes[i:i+8])
+                if i + 8 < len(hex_bytes):
+                    c_array += ",\n    "
+            
+            c_array += "\n};"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(c_array)
+
+    def copy_as_python_list(self):
+        """Copy as Python list"""
+        if hasattr(self, 'current_payload'):
+            py_list = "packet = [\n    "
+            hex_bytes = [f"0x{byte:02x}" for byte in self.current_payload]
+            
+            # Format in rows of 8 bytes
+            for i in range(0, len(hex_bytes), 8):
+                py_list += ', '.join(hex_bytes[i:i+8])
+                if i + 8 < len(hex_bytes):
+                    py_list += ",\n    "
+            
+            py_list += "\n]"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(py_list)
+
+    def save_as_binary(self):
+        """Save payload as binary file"""
+        if hasattr(self, 'current_payload'):
+            from tkinter import filedialog
+            filename = filedialog.asksaveasfilename(
+                title="Save payload as binary",
+                defaultextension=".bin",
+                filetypes=[("Binary files", "*.bin"), ("All files", "*.*")]
+            )
+            if filename:
+                with open(filename, 'wb') as f:
+                    f.write(bytes(self.current_payload))
+
+    def detect_protocol_fields(self, payload):
+        """Detect protocol fields in payload"""
+        fields = []
+        
+        # Se il payload inizia con Ethernet header
+        if len(payload) >= 14:
+            ethertype = (payload[12] << 8) | payload[13] if len(payload) > 13 else 0
+            
+            if ethertype == 0x0800 or ethertype == 0x86DD:
+                fields.append({
+                    'name': 'Ethernet',
+                    'start': 0,
+                    'end': 14
+                    # NO COLOR HERE
+                })
+                offset = 14
+            else:
+                offset = 0
+        else:
+            offset = 0
+        
+        # Check for IP header
+        if offset < len(payload) and len(payload) >= offset + 20:
+            version = (payload[offset] >> 4) & 0xF
+            
+            if version == 4:  # IPv4
+                ihl = (payload[offset] & 0x0F) * 4
+                fields.append({
+                    'name': 'IPv4',
+                    'start': offset,
+                    'end': offset + ihl
+                    # NO COLOR HERE
+                })
+                
+                if offset + 9 < len(payload):
+                    protocol = payload[offset + 9]
+                    next_offset = offset + ihl
+                    
+                    if protocol == 6:  # TCP
+                        if len(payload) >= next_offset + 20:
+                            data_offset = ((payload[next_offset + 12] >> 4) & 0xF) * 4
+                            fields.append({
+                                'name': 'TCP',
+                                'start': next_offset,
+                                'end': next_offset + data_offset
+                                # NO COLOR HERE
+                            })
+                            offset = next_offset + data_offset
+                        
+                    elif protocol == 17:  # UDP
+                        if len(payload) >= next_offset + 8:
+                            fields.append({
+                                'name': 'UDP',
+                                'start': next_offset,
+                                'end': next_offset + 8
+                                # NO COLOR HERE
+                            })
+                            offset = next_offset + 8
+                    else:
+                        offset = next_offset
+                else:
+                    offset = offset + ihl
+            else:
+                offset = 0
+        
+        # Remaining data
+        if offset < len(payload):
+            fields.append({
+                'name': 'Data',
+                'start': offset,
+                'end': len(payload)
+                # NO COLOR HERE
+            })
+        
+        self.protocol_fields = fields
+        return fields
+
+    def apply_field_highlighting(self, field, payload):
+        """Apply highlighting tags for protocol field"""
+        tag_name = f"field_{field['start']}_{field['end']}"
+        
+        # Initialize field_mappings if not exists
+        if not hasattr(self, 'field_mappings'):
+            self.field_mappings = {}
+        
+        # Calculate which lines contain this field
+        start_line = field['start'] // 16
+        end_line = (field['end'] - 1) // 16
+        
+        for line_num in range(start_line, end_line + 1):
+            # Calculate which bytes in this line belong to the field
+            line_start_byte = line_num * 16
+            
+            field_start_in_line = max(0, field['start'] - line_start_byte)
+            field_end_in_line = min(16, field['end'] - line_start_byte)
+            
+            if field_start_in_line >= field_end_in_line:
+                continue
+            
+            # HEX PART - include all spaces between bytes
+            if field_start_in_line < 8 and field_end_in_line <= 8:
+                # All in first group
+                hex_start_col = 6 + field_start_in_line * 3
+                hex_end_col = 6 + field_end_in_line * 3 - 1
+            elif field_start_in_line >= 8:
+                # All in second group (after double space)
+                hex_start_col = 31 + (field_start_in_line - 8) * 3
+                hex_end_col = 31 + (field_end_in_line - 8) * 3 - 1
+            else:
+                # Spans both groups - include the double space
+                hex_start_col = 6 + field_start_in_line * 3
+                hex_end_col = 31 + (field_end_in_line - 8) * 3 - 1
+            
+            hex_start = f"{line_num + 1}.{hex_start_col}"
+            hex_end = f"{line_num + 1}.{hex_end_col}"
+            self.hex_text.tag_add(tag_name, hex_start, hex_end)
+            
+            # ASCII PART - CORRECTED POSITION
+            # Count exactly: "0000  " (6) + "xx " * 8 (24) + "  " (2) + "xx " * 7 + "xx" (23) + "  " (2) = 57
+            # But let's verify by looking at your actual output
+            ascii_start_col = 56 + field_start_in_line  # Try 56 instead of 57
+            ascii_end_col = 56 + field_end_in_line
+            
+            ascii_start = f"{line_num + 1}.{ascii_start_col}"
+            ascii_end = f"{line_num + 1}.{ascii_end_col}"
+            self.hex_text.tag_add(tag_name, ascii_start, ascii_end)
+        
+        # Just store field info
+        self.field_mappings[tag_name] = field
+
+    def on_payload_hover(self, event):
+        """Handle hover on hex text"""
+        if not hasattr(self, 'hex_text'):
+            return
+        
+        # Clear previous highlight first
+        if hasattr(self, 'current_highlight_tag') and self.current_highlight_tag:
+            # Just remove the tag configuration completely
+            self.hex_text.tag_configure(self.current_highlight_tag, 
+                                    background="",
+                                    foreground="")
+        
+        # Get position under mouse
+        mouse_index = self.hex_text.index(f"@{event.x},{event.y}")
+        tags = self.hex_text.tag_names(mouse_index)
+        
+        # Find field tag
+        field_found = False
+        for tag in tags:
+            if tag.startswith("field_") and tag in self.field_mappings:
+                field = self.field_mappings[tag]
+                
+                # Apply Wireshark blue ONLY on hover
+                self.hex_text.tag_configure(tag, 
+                                        background="#3399ff",  # Wireshark blue
+                                        foreground="white")     # White text
+                
+                # Show tooltip
+                if not hasattr(self, 'current_highlight_tag') or self.current_highlight_tag != tag:
+                    self.show_field_tooltip(event, field)
+                    self.current_highlight_tag = tag
+                
+                field_found = True
+                self.hex_text.config(cursor="hand2")
+                break
+        
+        if not field_found:
+            self.clear_field_highlight()
+            self.hex_text.config(cursor="arrow")
+
+    
+    def clear_field_highlight(self):
+        """Clear all field highlights"""
+        if hasattr(self, 'current_highlight_tag') and self.current_highlight_tag:
+            # Remove ALL tag configuration
+            self.hex_text.tag_configure(self.current_highlight_tag,
+                                    background="",  # No background
+                                    foreground="")  # Default foreground
+            self.current_highlight_tag = None
+        
+        if hasattr(self, 'hex_text'):
+            self.hex_text.config(cursor="arrow")
+        
+        # Hide tooltip
+        if hasattr(self, 'field_tooltip') and self.field_tooltip:
+            self.field_tooltip.destroy()
+            self.field_tooltip = None
+    
+
+    def show_field_tooltip(self, event, field):
+        """Show tooltip with field info"""
+        # Remove old tooltip
+        if hasattr(self, 'field_tooltip') and self.field_tooltip:
+            self.field_tooltip.destroy()
+            self.field_tooltip = None
+        
+        self.field_tooltip = tk.Toplevel()
+        self.field_tooltip.wm_overrideredirect(True)
+        
+        # Create more detailed info
+        info = f"Protocol: {field['name']}\n"
+        info += f"Offset: {field['start']}-{field['end']}\n"
+        info += f"Size: {field['end']-field['start']} bytes"
+        
+        label = tk.Label(self.field_tooltip, 
+                        text=info,
+                        background="lightyellow",
+                        relief="solid", 
+                        borderwidth=1,
+                        font=("Arial", 9),
+                        padx=5,
+                        pady=2)
+        label.pack()
+        
+        # Position tooltip near mouse but not under it
+        x = self.hex_text.winfo_rootx() + event.x + 15
+        y = self.hex_text.winfo_rooty() + event.y - 30
+        self.field_tooltip.geometry(f"+{x}+{y}")
+
+    def on_payload_leave(self, event):
+        """Clear highlights when leaving"""
+        self.clear_field_highlight()
 
     def clear_setup_virtual_treeview(self):
         """Clears the Treeview and resets the counters"""
@@ -2789,44 +3574,35 @@ class NetworkAnalyzer:
         
         def on_motion(event):
             if canvas._nav_pan_active and event.inaxes == canvas._nav_axes:
-                # Calculate the movement in pixels
-
-                dx = event.x - canvas._nav_start_x
-                dy = event.y - canvas._nav_start_y
+                # Calculate pixel movement
+                dx_pixels = event.x - canvas._nav_start_x
+                dy_pixels = event.y - canvas._nav_start_y
                 
-                # Convert the movement to data units
-
                 ax = canvas._nav_axes
+                
+                # Get current view limits
                 xlim = canvas._nav_xlim_start
                 ylim = canvas._nav_ylim_start
                 
-                # Get the size of the graphic designer in pixel
-
-                bbox = ax.get_window_extent().transformed(canvas.figure.dpi_scale_trans.inverted())
-                width_inches, height_inches = bbox.width, bbox.height
-                width_pixels = width_inches * canvas.figure.dpi
-                height_pixels = height_inches * canvas.figure.dpi
+                # Get axes size in display coordinates
+                bbox = ax.get_window_extent()
+                width_pixels = bbox.width
+                height_pixels = bbox.height
                 
-                # Calculate the movement to data units
-
+                # Calculate data range
                 x_range = xlim[1] - xlim[0]
                 y_range = ylim[1] - ylim[0]
                 
-                x_scale = x_range / width_pixels
-                y_scale = y_range / height_pixels
+                # Calculate shift in data coordinates
+                # Note: screen Y increases downward, data Y increases upward
+                dx_data = -dx_pixels * x_range / width_pixels
+                dy_data = dy_pixels * y_range / height_pixels
                 
-                # Calculate the new limits
-
-                new_xlim = (xlim[0] - dx * x_scale, xlim[1] - dx * x_scale)
-                new_ylim = (ylim[0] + dy * y_scale, ylim[1] + dy * y_scale)
+                # Apply the shift
+                ax.set_xlim(xlim[0] + dx_data, xlim[1] + dx_data)
+                ax.set_ylim(ylim[0] + dy_data, ylim[1] + dy_data)
                 
-                # Set the new limits
-
-                ax.set_xlim(new_xlim)
-                ax.set_ylim(new_ylim)
-                
-                # Update Canvas
-
+                # Redraw
                 canvas.draw_idle()
         
         def on_scroll(event):
@@ -5342,15 +6118,14 @@ class NetworkAnalyzer:
         def run_analysis():
             try:
                 # Clean threat table
-
                 self.root.after(0, lambda: [self.threat_tree.delete(item) for item in self.threat_tree.get_children()])
                 
                 if not update_progress(10, "Analysis preparation..."):
                     return
                 
-                # Analyze packages
-
+                # Initialize threat tracking
                 threat_count = 0
+                threat_scores = {}  # Track threat confidence scores
                 total_packets = len(self.captured_packets)
                 
                 if not update_progress(15, f"Packet Analyzer (0/{total_packets})..."):
@@ -5358,96 +6133,110 @@ class NetworkAnalyzer:
                 
                 for i, packet in enumerate(self.captured_packets):
                     # Check if the analysis has been interrupted
-
                     if not self.threat_analysis_running:
                         return
                     
                     # Check if it's a threat
-
                     if self.is_potential_threat(packet):
                         threat_type, severity = self.classify_threat(packet)
                         
+                        # Calculate threat confidence score (0-100%)
+                        confidence_score = self.calculate_threat_confidence(packet, threat_type, severity)
+                        
                         # Apply severity filter
-
                         if (severity == "High" and not self.show_high_severity.get()) or \
                         (severity == "Medium" and not self.show_medium_severity.get()) or \
                         (severity == "Low" and not self.show_low_severity.get()):
                             continue
                         
                         timestamp = time.strftime("%H:%M:%S", time.localtime(packet['time']))
-                        src = packet['src']
-                        dst = packet['dst']
+                        src = packet.get('src', 'Unknown')
+                        dst = packet.get('dst', 'Unknown')
                         
-                        # Add to the threat table (it must be done in the main thread)
-
-                        def add_threat_to_tree(ts, s, d, tt, sev, idx):
-                            self.add_threat(ts, s, d, tt, sev, f"Potential threat detected (Packet {idx})")
+                        # Create detailed threat description
+                        threat_description = self.create_threat_description(packet, threat_type, confidence_score, i)
                         
-                        self.root.after(0, lambda ts=timestamp, s=src, d=dst, tt=threat_type, sev=severity, idx=i: 
-                                        add_threat_to_tree(ts, s, d, tt, sev, idx))
+                        # Add to the threat table (must be done in the main thread)
+                        def add_threat_to_tree(ts, s, d, tt, sev, desc):
+                            self.add_threat(ts, s, d, tt, sev, desc)
+                        
+                        self.root.after(0, lambda ts=timestamp, s=src, d=dst, tt=threat_type, 
+                                    sev=severity, desc=threat_description: 
+                                    add_threat_to_tree(ts, s, d, tt, sev, desc))
+                        
+                        # Store threat score for statistics
+                        threat_scores[threat_count] = confidence_score
                         threat_count += 1
                     
-                    # Upded progress every 50 packages or at the last package
-
+                    # Update progress every 50 packages or at the last package
                     if i % 50 == 0 or i == total_packets - 1:
                         progress_percent = 15 + (i / total_packets) * 75
                         if not update_progress(progress_percent, f"Packet Parser ({i+1}/{total_packets})... Threats found: {threat_count}"):
                             return
                 
-                # Make sure the double -click event is configured
-
+                # Calculate threat statistics
+                if threat_scores:
+                    avg_confidence = sum(threat_scores.values()) / len(threat_scores)
+                    max_confidence = max(threat_scores.values())
+                    min_confidence = min(threat_scores.values())
+                else:
+                    avg_confidence = max_confidence = min_confidence = 0
+                
+                # Make sure the double-click event is configured
                 if not update_progress(90, "Interface configuration..."):
                     return
                     
                 self.root.after(0, self.setup_threat_details)
                 
                 # Set up context menu for threat tree
-
                 self.root.after(0, self.setup_threat_context_menu)
                 
                 # Complete the analysis
-
                 if not update_progress(95, f"Scan complete: {threat_count} threats detected"):
                     return
                 
                 # If we found threats and the analysis has not been interrupted, highlight the first
-
                 if threat_count > 0 and self.threat_analysis_running:
                     def select_first_threat():
                         if self.threat_tree.get_children():  # Check that there are elements
-
                             first_item = self.threat_tree.get_children()[0]
                             self.threat_tree.selection_set(first_item)
                             self.threat_tree.focus(first_item)
-                            self.status_bar.config(text=f"Scan complete: {threat_count} threats detected. Double-click for details.")
+                            status_text = (f"Scan complete: {threat_count} threats detected. "
+                                        f"Avg confidence: {avg_confidence:.1f}%. "
+                                        f"Double-click for details.")
+                            self.status_bar.config(text=status_text)
                     
                     self.root.after(0, select_first_threat)
                 
-                # Finalizes
-
+                # Finalize
                 if not update_progress(100, "Viewing results..."):
                     return
                 
                 # Close the progress window and show the result only if the analysis has not been interrupted
-
                 if self.threat_analysis_running:
                     self.root.after(1000, progress_window.destroy)  # Wait 1 second before closing
-
-                    self.root.after(1100, lambda: messagebox.showinfo("Analysis completed", 
-                                                                    f"Detect {threat_count} potential threats.\n\n" +
-                                                                    "Double-click a threat in the table to view the details."))
+                    
+                    # Create detailed result message
+                    result_message = (f"Threat Analysis Complete!\n\n"
+                                    f"Total threats detected: {threat_count}\n"
+                                    f"Average confidence: {avg_confidence:.1f}%\n"
+                                    f"Highest confidence: {max_confidence:.1f}%\n"
+                                    f"Lowest confidence: {min_confidence:.1f}%\n\n"
+                                    f"Double-click a threat in the table to view details.")
+                    
+                    self.root.after(1100, lambda: messagebox.showinfo("Analysis completed", result_message))
                     self.root.after(1200, lambda: self.status_bar.config(text=f"Scan complete: {threat_count} threats detected"))
             
             except Exception as e:
                 print(f"Error in threat analysis: {str(e)}")
                 traceback.print_exc()
                 if self.threat_analysis_running:  # Check that the analysis has not been interrupted
-
-                    self.root.after(0, lambda: messagebox.showerror("Error", f"Error in threat analysis: {str(e)}"))
+                    error_msg = f"Error in threat analysis: {str(e)}\n\nCheck console for details."
+                    self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
                     self.root.after(0, progress_window.destroy)
-        
-        # Start the analysis in a separate thread
 
+        # Start the analysis in a separate thread
         if not update_progress(5, "Start analysis..."):
             return
             
@@ -5742,12 +6531,67 @@ class NetworkAnalyzer:
         filter_window.geometry(f"+{position_x}+{position_y}")
             
 
+
+    def determine_anomaly_type(self, packet, score):
+        """Determine the type of anomaly based on packet characteristics"""
+        # Check packet size
+        packet_size = packet.get('len', 0)
+        if packet_size > 5000:
+            return "Large Packet Anomaly"
+        elif packet_size < 20:
+            return "Tiny Packet Anomaly"
+        
+        # Check protocol
+        proto = packet.get('proto_name', '')
+        if proto not in ['TCP', 'UDP', 'ICMP', 'ARP']:
+            return "Protocol Anomaly"
+        
+        # Check ports
+        sport = packet.get('sport', 0)
+        dport = packet.get('dport', 0)
+        suspicious_ports = [23, 135, 139, 445, 3389, 4444, 5555]
+        if sport in suspicious_ports or dport in suspicious_ports:
+            return "Suspicious Port"
+        
+        # Return based on score
+        if score >= 90:
+            return "Critical Anomaly"
+        elif score >= 80:
+            return "High Risk Pattern"
+        elif score >= 60:
+            return "Suspicious Activity"
+        else:
+            return "Anomalous Behavior"
+        
+    def enhance_with_ollama(self):
+            """Migliora l'analisi ML con validazione Ollama"""
+            
+            # Inizializza Ollama validator
+            if not hasattr(self, 'ollama_validator'):
+                self.ollama_validator = OllamaValidator()
+            
+            # Verifica connessione Ollama
+            if not self.ollama_validator.check_connection():
+                response = messagebox.askyesno(
+                    "Ollama non disponibile",
+                    "Ollama non è raggiungibile. Vuoi continuare solo con l'analisi ML?"
+                )
+                if not response:
+                    return False
+                self.use_ollama = False
+            else:
+                self.use_ollama = True
+            
+            return True
+        # Function to update the progress bar
+            
     def _run_ml_analysis(self):
         """In-house anomaly detection implementation with real-time anomaly addition"""
         # Variable to check if the analysis has been interrupted
 
         self.ml_analysis_running = True
-        
+        if not self.enhance_with_ollama():
+            return
         # Create a dialog to show progress
 
         progress_window = tk.Toplevel(self.root)
@@ -5805,8 +6649,7 @@ class NetworkAnalyzer:
         position_right = int(self.root.winfo_screenwidth()/2 - window_width/2)
         position_down = int(self.root.winfo_screenheight()/2 - window_height/2)
         progress_window.geometry(f"+{position_right}+{position_down}")
-        
-        # Function to update the progress bar
+
 
         def update_progress(value, message):
             if not self.ml_analysis_running:
@@ -5818,7 +6661,6 @@ class NetworkAnalyzer:
             progress_window.update_idletasks()
             return True  # The analysis continues
 
-        
         # Function to stop analysis
 
         def stop_ml_analysis():
@@ -5836,34 +6678,98 @@ class NetworkAnalyzer:
         # Store anomalies for reference
 
         self.ml_detected_anomalies = []
+        if not hasattr(self, 'known_good_packets'):
+            self.known_good_packets = []
         
         # Function to add an anomaly to the threat table in real time
 
         def add_anomaly_to_table(packet_idx, score, packet, severity):
+                # Prima ottieni il tipo di anomalia
+            anomaly_type = self.determine_anomaly_type(packet, score)
+            
+            # Se Ollama è disponibile, ottieni una seconda opinione
+            ollama_result = None
+            if hasattr(self, 'use_ollama') and self.use_ollama:
+                ollama_result = self.ollama_validator.analyze_packet(packet, score, anomaly_type)
+            
+            # Determina la severity finale combinando ML e Ollama
+            final_severity = severity
+            combined_confidence = score
+            
+            if ollama_result and ollama_result['success']:
+                # Combina i risultati ML e Ollama
+                ml_weight = 0.6  # 60% peso per ML
+                ollama_weight = 0.4  # 40% peso per Ollama
+                
+                # Se Ollama conferma la minaccia
+                if ollama_result['is_threat']:
+                    combined_confidence = (score * ml_weight) + (ollama_result['confidence'] * ollama_weight)
+                else:
+                    # Se Ollama non conferma, riduci la confidence
+                    combined_confidence = score * 0.5
+                
+                # Ridetermina la severity basata sulla confidence combinata
+                if combined_confidence >= 80:
+                    final_severity = "High"
+                elif combined_confidence >= 60:
+                    final_severity = "Medium"
+                elif combined_confidence >= 40:
+                    final_severity = "Low"
+                else:
+                    # Se la confidence combinata è troppo bassa, potrebbe essere un falso positivo
+                    final_severity = "Low (Possible False Positive)"
+            
+            # Aggiungi alla UI con informazioni combinate
             timestamp = time.strftime("%H:%M:%S", time.localtime(packet['time']))
             src = packet['src']
             dst = packet['dst']
             
-            # Add to the threat table in the main thread
-
             def add_to_ui():
-                item_id = self.add_threat(timestamp, src, dst, "ML Anomaly", severity, 
-                            f"Anomaly detected by ML (score: {score:.3f}, packet_idx: {packet_idx})")
+                # Prepara la descrizione con entrambi i risultati
+                score_text = f"{score:.1f}%"
+                description = f"ML Score: {score_text}"
                 
-                # Memorizes information on anomaly
-
+                if ollama_result and ollama_result['success']:
+                    description += f" | Ollama: {'Confirmed' if ollama_result['is_threat'] else 'Not Confirmed'}"
+                    description += f" ({ollama_result['confidence']}%)"
+                    if ollama_result.get('explanation'):
+                        description += f" - {ollama_result['explanation'][:50]}"
+                
+                description += f" | Combined Confidence: {combined_confidence:.1f}%"
+                
+                # Aggiungi dettagli specifici del pacchetto
+                if packet.get('len', 0) > 10000:
+                    description += " | Large packet"
+                if packet.get('proto_name') not in ['TCP', 'UDP', 'ICMP']:
+                    description += f" | Unusual protocol: {packet.get('proto_name', 'Unknown')}"
+                
+                # Usa colori diversi basati sulla validazione Ollama
+                if ollama_result and ollama_result['success']:
+                    if ollama_result['is_threat']:
+                        threat_type = "ML+AI Confirmed Anomaly"
+                    else:
+                        threat_type = "ML Anomaly (AI Unconfirmed)"
+                else:
+                    threat_type = "ML Anomaly"
+                
+                item_id = self.add_threat(timestamp, src, dst, threat_type, final_severity, description)
+                
+                # Memorizza informazioni estese sull'anomalia
                 self.ml_detected_anomalies.append({
                     'item_id': item_id,
                     'packet_idx': packet_idx,
-                    'score': score,
-                    'severity': severity,
-                    'is_false_positive': False  # Initially set to False
-
+                    'ml_score': score,
+                    'ollama_result': ollama_result,
+                    'combined_confidence': combined_confidence,
+                    'severity': final_severity,
+                    'anomaly_type': anomaly_type,
+                    'is_false_positive': False
                 })
-                
+            
             self.root.after(0, add_to_ui)
         
         # Perform the analysis in a separate thread so as not to block the UI
+
 
         def run_analysis():
             try:
@@ -5909,33 +6815,52 @@ class NetworkAnalyzer:
                             # Predic with the model
 
                             predictions_batch = self.ml_model.predict(X_scaled_batch)
-                            scores_batch = self.ml_model.decision_function(X_scaled_batch)
-                            
-                            # Identify the anomalies (values ​​-1) and add them in real time
 
-                            for j, (pred, score, packet_idx) in enumerate(zip(predictions_batch, scores_batch, batch_indices)):
+                            # Calcola anomaly scores più significativi (0-100%)
+                            if hasattr(self.ml_model, 'score_samples'):
+                                # Per Isolation Forest
+                                raw_scores_batch = self.ml_model.score_samples(X_scaled_batch)
+                                # Converti in percentuale di anomalia (0-100)
+                                min_score = raw_scores_batch.min()
+                                max_score = raw_scores_batch.max()
+                                if max_score > min_score:
+                                    # Inverti: score più bassi = più anomali = percentuale più alta
+                                    anomaly_scores_batch = (1 - (raw_scores_batch - min_score) / (max_score - min_score)) * 100
+                                else:
+                                    anomaly_scores_batch = np.full_like(raw_scores_batch, 50.0)
+                            else:
+                                # Per altri modelli, usa decision_function normalizzata
+                                raw_scores_batch = self.ml_model.decision_function(X_scaled_batch)
+                                min_score = raw_scores_batch.min()
+                                max_score = raw_scores_batch.max()
+                                if max_score > min_score:
+                                    # Trasforma in percentuale: valori più negativi = più anomali
+                                    anomaly_scores_batch = ((max_score - raw_scores_batch) / (max_score - min_score)) * 100
+                                else:
+                                    anomaly_scores_batch = np.full_like(raw_scores_batch, 50.0)
+
+                            # Identify the anomalies (values -1) and add them in real time
+                            for j, (pred, anomaly_score, packet_idx) in enumerate(zip(predictions_batch, anomaly_scores_batch, batch_indices)):
                                 if pred == -1:
-                                    # Determines severity based on the score
-
-                                    if score < -0.3:
+                                    # Determines severity based on the anomaly score (0-100%)
+                                    if anomaly_score >= 80:
                                         severity = "High"
                                         if not self.show_high_severity.get():
-                                            continue  # Jump if filtered
-
-                                    elif score < -0.2:
+                                            continue
+                                    elif anomaly_score >= 60:
                                         severity = "Medium"
                                         if not self.show_medium_severity.get():
-                                            continue  # Jump if filtered
-
-                                    else:
+                                            continue
+                                    elif anomaly_score >= 40:
                                         severity = "Low"
                                         if not self.show_low_severity.get():
-                                            continue  # Jump if filtered
-
+                                            continue
+                                    else:
+                                        # Score troppo basso, probabilmente rumore
+                                        continue
                                     
                                     # Add the anomaly to the table in real time
-
-                                    add_anomaly_to_table(packet_idx, score, self.captured_packets[packet_idx], severity)
+                                    add_anomaly_to_table(packet_idx, anomaly_score, self.captured_packets[packet_idx], severity)
                             
                             # Save all the features for future reference
 
@@ -6646,150 +7571,134 @@ class NetworkAnalyzer:
             return False
 
     def classify_iot_device(self, ip, info):
-        """Classify an IoT device based on network behavior"""
-        # Get information from the info dictionary
+        """Device classification - DEFAULT to non-IoT unless proven otherwise"""
         ports = info["ports"]
-        protocols = info["protocols"]
+        protocols = info["protocols"] 
         traffic = info["traffic"]
+        connections = info.get("connections", set())
+        packet_count = info.get("packet_count", 0)
         
-        # Get the manufacturer using the IP address
-        # The guess_manufacturer function now accepts IP and will attempt to resolve MAC or use the IP as a fallback
-        manufacturer = self.guess_manufacturer(ip)
+        # Get manufacturer
+        manufacturer = self.guess_manufacturer(ip).lower()
         
-        # Use the identified manufacturer to improve the classification
-        if manufacturer != "Manufacturer unknown":
-            # Classificazione basata sul produttore
-            if any(brand in manufacturer.lower() for brand in ["amazon", "amazon technologies"]):
-                if 5353 in ports and "UDP" in protocols:
-                    return "Amazon Echo/Alexa Device"
-                return "Amazon Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["google", "google inc"]):
-                if 5353 in ports and "UDP" in protocols:
-                    return "Google Home/Nest Device"
-                elif 8008 in ports or 8009 in ports:
-                    return "Google Chromecast"
-                return "Google Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["apple", "apple inc"]):
-                if 5353 in ports and "UDP" in protocols:
-                    return "Apple HomePod"
-                return "Apple IoT Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["samsung", "samsung electronics"]):
-                if traffic > 100000:
-                    return "Samsung Smart TV"
-                return "Samsung Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["philips", "signify", "philips lighting"]):
-                return "Philips Hue/Smart Lighting"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["xiaomi", "mi", "tuya"]):
+        # === POSITIVE IoT IDENTIFICATION ===
+        # Only classify as IoT if we have POSITIVE evidence
+        
+        # 1. Known IoT protocols
+        iot_protocols_found = []
+        
+        if 1883 in ports or 8883 in ports:
+            iot_protocols_found.append("MQTT")
+        if 5683 in ports or 5684 in ports:
+            iot_protocols_found.append("CoAP")
+        if 6668 in ports:
+            iot_protocols_found.append("Tuya")
+        if 54321 in ports:
+            iot_protocols_found.append("Xiaomi")
+        
+        # If we found IoT protocols, classify based on them
+        if iot_protocols_found:
+            if "MQTT" in iot_protocols_found:
                 if traffic < 10000:
-                    return "Xiaomi/Tuya Sensor"
-                return "Xiaomi/Tuya Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["tp-link"]):
-                if 67 in ports or 68 in ports or 53 in ports:
-                    return "TP-Link Router"
-                return "TP-Link Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["netgear"]):
-                if 67 in ports or 68 in ports or 53 in ports:
-                    return "Netgear Router"
-                return "Netgear Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["huawei", "hisilicon"]):
-                if 67 in ports or 68 in ports or 53 in ports:
-                    return "Huawei Router"
-                return "Huawei Smart Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["espressif", "esp"]):
-                return "ESP IoT Device/Sensor"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["raspberry", "pi"]):
-                return "Raspberry Pi IoT Device"
-                    
-            elif any(brand in manufacturer.lower() for brand in ["arduino"]):
-                return "Arduino IoT Device"
-                    
-            # If we have the manufacturer but not a specific classification
-            return f"{manufacturer} IoT Device"
+                    return "MQTT Sensor/Actuator"
+                else:
+                    return "MQTT Gateway/Hub"
+            elif "CoAP" in iot_protocols_found:
+                return "CoAP IoT Device"
+            elif "Tuya" in iot_protocols_found:
+                return "Tuya Smart Device"
+            elif "Xiaomi" in iot_protocols_found:
+                return "Xiaomi Mi Home Device"
         
-        # Fallback to behavioral classification if the manufacturer doesn't help
+        # 2. Known IoT device signatures
         
-        # Smart Hub/Gateway IoT
-        if (1883 in ports or 8883 in ports) and (80 in ports or 443 in ports):
-            if 8883 in ports:
-                return "Smart Hub (Secure)"
+        # Cameras - must have RTSP/RTMP
+        if 554 in ports:  # RTSP
+            if manufacturer and any(cam in manufacturer for cam in ["hikvision", "dahua", "axis", "vivotek"]):
+                return f"{manufacturer.title()} IP Camera"
+            elif traffic > 50000:  # Actual video traffic
+                return "IP Security Camera"
+        
+        # Smart TVs - specific ports required
+        if manufacturer and "samsung" in manufacturer and any(p in ports for p in [55000, 8001, 8002]):
+            return "Samsung Smart TV"
+        elif manufacturer and "lg" in manufacturer and any(p in ports for p in [3000, 3001]):
+            return "LG Smart TV"
+        elif 9080 in ports and traffic > 200000:
+            return "Smart TV"
+        
+        # Streaming devices - specific signatures
+        if 8008 in ports or 8009 in ports:
+            if manufacturer and "google" in manufacturer:
+                return "Google Chromecast"
             else:
-                return "Smart Hub"
+                return "Media Streaming Device"
         
-        # Smart Speaker/Assistant
-        if 5353 in ports and "UDP" in protocols:
-            if 1900 in ports:
-                return "Smart Speaker (Media)"
-            elif 80 in ports or 443 in ports:
-                return "Smart Assistant"
+        # Smart speakers - must have mDNS AND be from known manufacturer
+        if 5353 in ports and manufacturer:
+            if "amazon" in manufacturer and traffic < 100000:
+                return "Amazon Echo/Alexa"
+            elif "google" in manufacturer and traffic < 50000:
+                return "Google Home"
+            elif "apple" in manufacturer and 62078 in ports:
+                return "Apple HomePod"
+        
+        # Philips Hue - specific signature
+        if manufacturer and "philips" in manufacturer and 80 in ports and 443 in ports and traffic < 10000:
+            return "Philips Hue Bridge"
+        
+        # Printers - specific ports
+        if 9100 in ports or 631 in ports:
+            return "Network Printer"
+        
+        # === DEFAULT TO NON-IOT ===
+        
+        # Windows indicators
+        if any(p in ports for p in [135, 139, 445, 3389]):
+            return "Windows Computer"
+        
+        # Linux/Mac indicators
+        if 22 in ports:
+            if manufacturer and "apple" in manufacturer:
+                return "Mac Computer (SSH)"
             else:
-                return "Smart Speaker"
+                return "Linux/Unix System"
         
-        # Telecamere di sicurezza
-        if (554 in ports or 1935 in ports) or (traffic > 100000 and (80 in ports or 443 in ports)):
-            if 554 in ports:
-                return "Security Camera (RTSP)"
-            elif 1935 in ports:
-                return "Security Camera (RTMP)"
+        # Router/Network infrastructure
+        if (53 in ports or 67 in ports) and (80 in ports or 443 in ports):
+            return "Router/Gateway"
+        
+        # Mobile device patterns
+        if len(connections) > 20 and manufacturer:
+            if any(mobile in manufacturer for mobile in ["apple", "samsung", "xiaomi", "huawei", "oneplus", "google"]):
+                if "apple" in manufacturer and 62078 not in ports:
+                    return "iPhone/iPad"
+                else:
+                    return "Mobile Device"
+        
+        # Generic computer patterns
+        if len(ports) > 5 or traffic > 100000 or len(connections) > 15:
+            return "Computer/Server"
+        
+        # === FINAL CLASSIFICATION ===
+        
+        # Only classify as generic IoT if we have some evidence
+        if manufacturer and any(iot in manufacturer for iot in ["esp", "espressif", "tuya", "sonoff"]):
+            return f"{manufacturer.title()} IoT Device"
+        
+        # Low traffic alone is NOT enough to classify as IoT!
+        if traffic < 5000 and packet_count < 50:
+            # Must have other IoT indicators
+            if len(ports) == 1 and list(ports)[0] > 10000:
+                return "Possible IoT Device"
             else:
-                return "Smart Camera"
+                return "Idle Device"  # Not "IoT Sensor"!
         
-        # Smart TV/Media Devices
-        if (1900 in ports or 5353 in ports) and traffic > 50000:
-            if 8008 in ports or 8009 in ports:
-                return "Chromecast Device"
-            elif traffic > 200000:
-                return "Smart TV"
-            else:
-                return "Media Device"
-        
-        # Router/Gateway/Network Devices
-        if 53 in ports or 67 in ports or 68 in ports:
-            if 53 in ports and (67 in ports or 68 in ports):
-                return "Router"
-            elif 53 in ports:
-                return "DNS Server"
-            else:
-                return "Network Gateway"
-        
-        # Low-power sensors and devices
-        if traffic < 10000:
-            if 1883 in ports or 5683 in ports:
-                return "IoT Sensor"
-            elif len(ports) < 3:
-                return "Smart Sensor/Actuator" 
-        
-        # Smart Appliances
-        if (80 in ports or 443 in ports) and traffic < 50000 and traffic > 10000:
-            return "Smart Appliance"
-        
-        # Lighting Devices
-        if 5353 in ports and traffic < 5000:
-            return "Smart Lighting"
-        
-        # Thermostats and climate control
-        if (80 in ports or 443 in ports) and 1883 in ports and traffic < 15000:
-            return "Smart Thermostat"
-        
-        # Generic for devices with significant traffic
-        if traffic > 100000:
-            return "High-Bandwidth IoT Device"
-        elif traffic > 50000:
-            return "Medium-Bandwidth IoT Device"
-        elif traffic > 10000:
-            return "Low-Bandwidth IoT Device"
-        
-        # If we can't categorize specifically
-        return "Unknown IoT Device"
+        # Default: Unknown, not IoT
+        if traffic < 1000:
+            return "Inactive Device"
+        else:
+            return "Network Device"  # Generic, not IoT
 
     def get_mac_by_arp(self, ip):
         """Gets the MAC address corresponding to an IP using ARP (requires privileges)"""
@@ -6863,17 +7772,36 @@ class NetworkAnalyzer:
         return "Manufacturer unknown"
 
     def detect_iot_devices(self):
-        """Discovers IoT devices in the network"""
+        """AI-Enhanced IoT device discovery with vulnerability assessment"""
         if not self.captured_packets:
-            messagebox.showinfo("Information", "No packages to be analysed")
+            messagebox.showinfo("Information", "No packages to be analyzed")
             return
-            
-        # Pulisce tabella IOT
+        
+        # Show progress window
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("IoT Device Analysis")
+        progress_window.geometry("400x200")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+        
+        frame = ttk.Frame(progress_window, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="Analyzing IoT devices...", font=("Arial", 12, "bold")).pack()
+        progress = ttk.Progressbar(frame, mode='indeterminate')
+        progress.pack(fill=tk.X, pady=20)
+        progress.start()
+        
+        status_label = ttk.Label(frame, text="Collecting device information...")
+        status_label.pack()
+        
+        # Clear IoT table
         for item in self.iot_tree.get_children():
             self.iot_tree.delete(item)
-            
-        # Analizza pacchetti per identificare dispositivi
+        
+        # Analyze packets
         devices = {}
+        device_behaviors = {}  # Store behavioral patterns
         
         for packet in self.captured_packets:
             src_ip = packet.get('src', '')
@@ -6882,59 +7810,351 @@ class NetworkAnalyzer:
             if not src_ip or not dst_ip:
                 continue
             
-            # Aggiungi dispositivi se non già presenti
+            # Collect device information
             for ip in [src_ip, dst_ip]:
                 if ip not in devices and self.is_private_ip(ip):
                     devices[ip] = {
                         "protocols": set(),
                         "traffic": 0,
-                        "ports": set()
+                        "ports": set(),
+                        "packet_count": 0,
+                        "first_seen": packet.get('time', 0),
+                        "last_seen": packet.get('time', 0),
+                        "connections": set(),
+                        "packet_sizes": [],
+                        "time_patterns": []
+                    }
+                    device_behaviors[ip] = {
+                        "dns_queries": [],
+                        "http_requests": [],
+                        "broadcast_count": 0,
+                        "multicast_count": 0,
+                        "encryption_detected": False,
+                        "suspicious_ports": []
                     }
             
-            # Aggiorna informazioni sui dispositivi
+            # Update device information
             if src_ip in devices:
                 devices[src_ip]["traffic"] += packet.get('len', 0)
+                devices[src_ip]["packet_count"] += 1
+                devices[src_ip]["last_seen"] = packet.get('time', 0)
+                devices[src_ip]["connections"].add(dst_ip)
+                devices[src_ip]["packet_sizes"].append(packet.get('len', 0))
                 
-                if packet.get('proto_name') == 'TCP':
-                    devices[src_ip]["protocols"].add("TCP")
-                    if 'sport' in packet:
-                        devices[src_ip]["ports"].add(packet['sport'])
-                elif packet.get('proto_name') == 'UDP':
-                    devices[src_ip]["protocols"].add("UDP")
-                    if 'sport' in packet:
-                        devices[src_ip]["ports"].add(packet['sport'])
-                elif packet.get('proto_name') == 'ICMP':
-                    devices[src_ip]["protocols"].add("ICMP")
-            
-            if dst_ip in devices:
-                devices[dst_ip]["traffic"] += packet.get('len', 0)
+                # Protocol analysis
+                proto = packet.get('proto_name', '')
+                devices[src_ip]["protocols"].add(proto)
                 
-                if packet.get('proto_name') == 'TCP':
-                    devices[dst_ip]["protocols"].add("TCP")
-                    if 'dport' in packet:
-                        devices[dst_ip]["ports"].add(packet['dport'])
-                elif packet.get('proto_name') == 'UDP':
-                    devices[dst_ip]["protocols"].add("UDP")
-                    if 'dport' in packet:
-                        devices[dst_ip]["ports"].add(packet['dport'])
+                if proto == 'TCP' and 'sport' in packet:
+                    devices[src_ip]["ports"].add(packet['sport'])
+                elif proto == 'UDP' and 'sport' in packet:
+                    devices[src_ip]["ports"].add(packet['sport'])
+                    
+                # Behavioral analysis
+                if dst_ip.endswith('.255'):
+                    device_behaviors[src_ip]["broadcast_count"] += 1
+                elif dst_ip.startswith('224.') or dst_ip.startswith('239.'):
+                    device_behaviors[src_ip]["multicast_count"] += 1
+                
+                # Check for encryption
+                if packet.get('dport') in [443, 8883, 5671]:  # HTTPS, MQTTS, AMQPS
+                    device_behaviors[src_ip]["encryption_detected"] = True
         
-        # Classifica dispositivi
-        for ip, info in devices.items():
-            device_type = self.classify_iot_device(ip, info)
+        # Now analyze each device with AI
+        status_label.config(text="Running AI analysis on devices...")
+        
+        analyzed_devices = []
+        total_devices = len(devices)
+        
+        for idx, (ip, info) in enumerate(devices.items()):
+            status_label.config(text=f"Analyzing device {idx+1}/{total_devices}: {ip}")
+            progress_window.update()
             
-            # Passa l'indirizzo IP direttamente alla funzione guess_manufacturer
-            # che ora può gestire sia IP che MAC
-            manufacturer = self.guess_manufacturer(ip)
+            # Get AI analysis
+            ai_analysis = self.analyze_iot_device_with_ai(ip, info, device_behaviors.get(ip, {}))
+            
+            # Add to results
+            analyzed_devices.append({
+                'ip': ip,
+                'info': info,
+                'behavior': device_behaviors.get(ip, {}),
+                'ai_analysis': ai_analysis
+            })
+        
+        # Display results
+        for device in analyzed_devices:
+            ip = device['ip']
+            info = device['info']
+            ai = device['ai_analysis']
+            
+            # Extract values from AI analysis
+            device_type = ai.get('device_type', 'Unknown IoT Device')
+            manufacturer = ai.get('manufacturer', 'Unknown')
+            risk_level = ai.get('risk_level', 'Medium')
+            vulnerabilities = ai.get('vulnerabilities', [])
             
             protocols = ", ".join(info["protocols"])
             traffic = self.format_size(info["traffic"])
             
-            risk = self.evaluate_device_risk(ip, info, device_type)
+            # Create risk display with color
+            if risk_level == "Critical":
+                risk_display = f"CRITICAL: {risk_level}"
+            elif risk_level == "High":
+                risk_display = f"HIGH: {risk_level}"
+            elif risk_level == "Medium":
+                risk_display = f"MEDIUM: {risk_level}"
+            else:
+                risk_display = f"LOW: {risk_level}"
             
-            self.iot_tree.insert("", tk.END, values=(ip, device_type, manufacturer, protocols, traffic, risk))
+            # Add vulnerabilities count if any
+            if vulnerabilities:
+                risk_display += f" ({len(vulnerabilities)} vulns)"
+            
+            self.iot_tree.insert("", tk.END, values=(
+                ip, 
+                device_type, 
+                manufacturer, 
+                protocols, 
+                traffic, 
+                risk_display
+            ), tags=(risk_level.lower(),))
         
-        messagebox.showinfo("Device scan", f"Detected {len(devices)} devices in the network")
-        self.status_bar.config(text=f"Device scan completed: {len(devices)} devices detected")
+        # Configure tags for coloring
+        self.iot_tree.tag_configure('critical', foreground='darkred')
+        self.iot_tree.tag_configure('high', foreground='red')
+        self.iot_tree.tag_configure('medium', foreground='orange')
+        self.iot_tree.tag_configure('low', foreground='green')
+        
+        progress.stop()
+        progress_window.destroy()
+        
+        # Show summary
+        messagebox.showinfo("IoT Analysis Complete", 
+                        f"Detected {len(devices)} IoT devices\n"
+                        f"High-risk devices: {sum(1 for d in analyzed_devices if d['ai_analysis'].get('risk_level') in ['High', 'Critical'])}")
+        
+        self.status_bar.config(text=f"IoT scan completed: {len(devices)} devices analyzed")
+
+    def analyze_iot_device_with_ai(self, ip, device_info, behavior_info):
+        """Use AI to deeply analyze an IoT device"""
+        
+        if not hasattr(self, 'ollama_validator') or not self.use_ollama:
+            # Fallback to basic analysis
+            return {
+                'device_type': self.classify_iot_device(ip, device_info),
+                'manufacturer': self.guess_manufacturer(ip),
+                'risk_level': 'Medium',
+                'vulnerabilities': []
+            }
+        
+        # Prepare comprehensive device profile
+        device_profile = f"""<device_analysis>
+    IP Address: {ip}
+    Total Traffic: {device_info['traffic']} bytes
+    Packet Count: {device_info['packet_count']}
+    Active Time: {device_info['last_seen'] - device_info['first_seen']} seconds
+    Unique Connections: {len(device_info['connections'])}
+
+    Protocols Used: {', '.join(device_info['protocols'])}
+    Open Ports: {', '.join(map(str, sorted(device_info['ports'])))}
+
+    Network Behavior:
+    - Broadcast packets: {behavior_info.get('broadcast_count', 0)}
+    - Multicast packets: {behavior_info.get('multicast_count', 0)}
+    - Encryption detected: {behavior_info.get('encryption_detected', False)}
+    - Average packet size: {sum(device_info['packet_sizes'])/len(device_info['packet_sizes']) if device_info['packet_sizes'] else 0:.0f} bytes
+
+    Connected to IPs: {', '.join(list(device_info['connections'])[:10])}
+    </device_analysis>"""
+
+        prompt = f"""<role>
+    You are an IoT security expert specializing in device identification and vulnerability assessment.
+    </role>
+
+    {device_profile}
+
+    <task>
+    Analyze this IoT device and provide:
+
+    1. DEVICE IDENTIFICATION
+    - Specific device type (e.g., "Amazon Echo Dot 3rd Gen", "Xiaomi Mi Security Camera")
+    - Manufacturer (be specific if possible)
+    - Device category (smart speaker, camera, sensor, etc.)
+
+    2. BEHAVIORAL ANALYSIS
+    - Is the behavior normal for this device type?
+    - Any suspicious patterns?
+    - Communication patterns assessment
+
+    3. SECURITY ASSESSMENT
+    - Known vulnerabilities for this device type
+    - Risk level (Critical/High/Medium/Low)
+    - Specific security concerns
+
+    4. RECOMMENDATIONS
+    - Immediate security actions
+    - Configuration changes needed
+    </task>
+
+    Common IoT ports reference:
+    - 1883/8883: MQTT
+    - 5353: mDNS/Bonjour
+    - 554: RTSP (cameras)
+    - 1900: SSDP/UPnP
+    - 5683: CoAP
+    - 8008/8009: Chromecast
+    - 80/443: HTTP/HTTPS
+
+    Format as JSON:
+    {{
+    "device_type": "specific device model/type",
+    "manufacturer": "manufacturer name",
+    "category": "device category",
+    "confidence": 0-100,
+    "behavior_analysis": {{
+        "normal_behavior": true/false,
+        "suspicious_patterns": ["pattern1", "pattern2"],
+        "encryption_status": "good/poor/none"
+    }},
+    "vulnerabilities": ["vuln1", "vuln2"],
+    "risk_level": "Critical/High/Medium/Low",
+    "risk_factors": ["factor1", "factor2"],
+    "recommendations": ["action1", "action2"],
+    "cve_references": ["CVE-XXXX-XXXX"]
+    }}"""
+
+        try:
+            response = requests.post(
+                self.ollama_validator.api_endpoint,
+                json={
+                    "model": self.ollama_validator.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json"
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                ai_analysis = json.loads(result.get('response', '{}'))
+                
+                # Ensure all required fields
+                return {
+                    'device_type': ai_analysis.get('device_type', 'Unknown IoT Device'),
+                    'manufacturer': ai_analysis.get('manufacturer', 'Unknown'),
+                    'category': ai_analysis.get('category', 'Unknown'),
+                    'confidence': ai_analysis.get('confidence', 50),
+                    'risk_level': ai_analysis.get('risk_level', 'Medium'),
+                    'vulnerabilities': ai_analysis.get('vulnerabilities', []),
+                    'recommendations': ai_analysis.get('recommendations', []),
+                    'suspicious_patterns': ai_analysis.get('behavior_analysis', {}).get('suspicious_patterns', []),
+                    'cve_references': ai_analysis.get('cve_references', [])
+                }
+        except Exception as e:
+            print(f"AI analysis error: {e}")
+        
+        # Fallback
+        return {
+            'device_type': self.classify_iot_device(ip, device_info),
+            'manufacturer': self.guess_manufacturer(ip),
+            'risk_level': 'Medium',
+            'vulnerabilities': []
+        }
+
+
+    def show_iot_device_details(self, event=None):
+        """Show detailed IoT device analysis with AI insights"""
+        
+        selected = self.iot_tree.selection()
+        if not selected:
+            return
+        
+        item = self.iot_tree.item(selected[0])
+        values = item['values']
+        
+        if not values:
+            return
+        
+        ip = values[0]
+        
+        # Create detailed view window
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"IoT Device Analysis - {ip}")
+        detail_window.geometry("800x600")
+        detail_window.transient(self.root)
+        
+        notebook = ttk.Notebook(detail_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Tab 1: Device Overview
+        overview_frame = ttk.Frame(notebook)
+        notebook.add(overview_frame, text="Overview")
+        
+        overview_text = tk.Text(overview_frame, wrap=tk.WORD, font=("Arial", 10))
+        overview_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Get stored analysis
+        for device in getattr(self, 'last_iot_analysis', []):
+            if device.get('ip') == ip:
+                ai = device.get('ai_analysis', {})
+                
+                overview_text.insert(tk.END, f"Device: {ai.get('device_type', 'Unknown')}\n", "bold")
+                overview_text.insert(tk.END, f"Manufacturer: {ai.get('manufacturer', 'Unknown')}\n")
+                overview_text.insert(tk.END, f"Category: {ai.get('category', 'Unknown')}\n")
+                overview_text.insert(tk.END, f"Confidence: {ai.get('confidence', 0)}%\n\n")
+                
+                overview_text.insert(tk.END, "Security Assessment:\n", "bold")
+                overview_text.insert(tk.END, f"Risk Level: {ai.get('risk_level', 'Unknown')}\n")
+                
+                if ai.get('vulnerabilities'):
+                    overview_text.insert(tk.END, "\nKnown Vulnerabilities:\n", "bold")
+                    for vuln in ai['vulnerabilities']:
+                        overview_text.insert(tk.END, f"• {vuln}\n")
+                
+                if ai.get('cve_references'):
+                    overview_text.insert(tk.END, "\nCVE References:\n", "bold")
+                    for cve in ai['cve_references']:
+                        overview_text.insert(tk.END, f"• {cve}\n")
+                
+                if ai.get('suspicious_patterns'):
+                    overview_text.insert(tk.END, "\nSuspicious Patterns Detected:\n", "bold")
+                    for pattern in ai['suspicious_patterns']:
+                        overview_text.insert(tk.END, f"• {pattern}\n", "warning")
+                
+                break
+        
+        # Tab 2: Recommendations
+        rec_frame = ttk.Frame(notebook)
+        notebook.add(rec_frame, text="Security Recommendations")
+        
+        rec_text = tk.Text(rec_frame, wrap=tk.WORD, font=("Arial", 10))
+        rec_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Get AI recommendations
+        rec_text.insert(tk.END, "AI-Generated Security Recommendations:\n\n", "bold")
+        
+        for device in getattr(self, 'last_iot_analysis', []):
+            if device.get('ip') == ip:
+                recommendations = device.get('ai_analysis', {}).get('recommendations', [])
+                for i, rec in enumerate(recommendations, 1):
+                    rec_text.insert(tk.END, f"{i}. {rec}\n\n")
+                break
+        
+        # Configure text tags
+        overview_text.tag_configure("bold", font=("Arial", 10, "bold"))
+        overview_text.tag_configure("warning", foreground="red")
+        rec_text.tag_configure("bold", font=("Arial", 10, "bold"))
+        
+        # Buttons
+        button_frame = ttk.Frame(detail_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Button(button_frame, text="Export Report", 
+                command=lambda: self.export_iot_report(ip)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", 
+                command=detail_window.destroy).pack(side=tk.RIGHT, padx=5)
+        
 
     def evaluate_device_risk(self, ip, info, device_type):
         """Assess the security risk of a device"""
@@ -7565,7 +8785,6 @@ class NetworkAnalyzer:
         """Shows details of a selected threat with improved hex-to-text conversion"""
         try:
             # Get the selected element
-
             selected_items = self.threat_tree.selection()
             if not selected_items:
                 messagebox.showinfo("Information", "No Threats Selected")
@@ -7579,7 +8798,6 @@ class NetworkAnalyzer:
                 return
             
             # Extract information from the selection
-
             timestamp = values[0]
             src_ip = values[1]
             dst_ip = values[2]
@@ -7588,7 +8806,6 @@ class NetworkAnalyzer:
             description = values[5] if len(values) > 5 else ""
             
             # Search for the package ID in the description
-
             packet_id = None
             if "Packet" in description.lower():
                 match = re.search(r"Packet\s+(\d+)", description.lower())
@@ -7600,17 +8817,14 @@ class NetworkAnalyzer:
                         pass
             
             # Find the original package
-
             threat_packet = None
             
             # If we have an ID package, try using it directly
-
             if packet_id is not None and 0 <= packet_id < len(self.captured_packets):
                 threat_packet = self.captured_packets[packet_id]
                 print(f"Found Packet Directly by ID: {packet_id}")
             else:
                 # Otherwise look for TimesTamp, IP Source and Destination
-
                 for i, packet in enumerate(self.captured_packets):
                     packet_time = time.strftime("%H:%M:%S", time.localtime(packet['time']))
                     if (packet_time == timestamp and 
@@ -7626,7 +8840,6 @@ class NetworkAnalyzer:
                 return
             
             # Create a simplified window
-
             details_window = tk.Toplevel(self.root)
             details_window.title(f"Threat: {threat_type} - Package #{packet_id}")
             details_window.geometry("900x700")
@@ -7635,12 +8848,10 @@ class NetworkAnalyzer:
             details_window.grab_set()
             
             # Main frame
-
             main_frame = ttk.Frame(details_window)
             main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
             
             # Header
-
             header_frame = ttk.Frame(main_frame)
             header_frame.pack(fill=tk.X, pady=(0, 10))
             
@@ -7655,22 +8866,18 @@ class NetworkAnalyzer:
                 ttk.Label(header_frame, text=proto_info).pack(anchor=tk.W)
             
             # Notebook for cards
-
             notebook = ttk.Notebook(main_frame)
             notebook.pack(fill=tk.BOTH, expand=True, pady=10)
             
             # Card for the content
-
             content_frame = ttk.Frame(notebook)
             notebook.add(content_frame, text="Package Contents")
             
             # Text widget per il payload
-
             payload_text = scrolledtext.ScrolledText(content_frame, wrap=tk.WORD, height=20, font=("Consolas", 10))
             payload_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             
             # Add tags for formatting
-
             payload_text.tag_configure("header", font=("Arial", 11, "bold"), foreground="blue")
             payload_text.tag_configure("subheader", font=("Arial", 10, "bold"), foreground="dark blue")
             payload_text.tag_configure("highlight", background="#FFFF99")
@@ -7678,29 +8885,25 @@ class NetworkAnalyzer:
             payload_text.tag_configure("hex", foreground="#0066CC")
             payload_text.tag_configure("ascii", foreground="#009900")
             payload_text.tag_configure("alert", foreground="red", font=("Arial", 10, "bold"))
+            payload_text.tag_configure("ai_analysis", foreground="#8B008B", font=("Arial", 10, "italic"))
             
             # View Payload
-
             if 'payload' in threat_packet and threat_packet['payload']:
                 payload_data = threat_packet['payload']
                 
                 # Intelligent interpretation section
-
                 payload_text.insert(tk.END, "=== INTELLIGENT INTERPRETATION ===\n", "header")
                 
                 # Determine the type of protocol
-
                 proto_name = threat_packet.get('proto_name', '').upper()
                 
                 # Specific analysis for protocol
-
                 if proto_name == 'HTTP':
                     try:
                         payload_str = payload_data.decode('utf-8', errors='replace')
                         payload_text.insert(tk.END, "\nInquiry/Response HTTP:\n\n", "subheader")
                         
                         # Highlights Header and HTTP methods
-
                         lines = payload_str.split('\n')
                         for line in lines:
                             if any(method in line for method in ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']):
@@ -7713,7 +8916,6 @@ class NetworkAnalyzer:
                                 payload_text.insert(tk.END, f"{line}\n")
                         
                         # Search for suspicious patterns
-
                         suspicious_patterns = [
                             ('SQL Injection', r'(SELECT|INSERT|UPDATE|DELETE).*FROM'),
                             ('XSS', r'<script|javascript:|onerror=|onload='),
@@ -7732,15 +8934,12 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, "\nQuery/Answer DNS:\n\n", "subheader")
                     try:
                         # Simplified DNS analysis
-
                         if len(payload_data) >= 12:  # Header DNS minimo
                             # Estrai Transaction ID
-
                             trans_id = int.from_bytes(payload_data[0:2], byteorder='big')
                             payload_text.insert(tk.END, f"Transaction ID: 0x{trans_id:04x}\n")
                             
                             # Flags
-
                             flags = int.from_bytes(payload_data[2:4], byteorder='big')
                             qr = (flags >> 15) & 1
                             opcode = (flags >> 11) & 0xF
@@ -7756,7 +8955,6 @@ class NetworkAnalyzer:
                             payload_text.insert(tk.END, f"Flags: AA={aa}, TC={tc}, RD={rd}, RA={ra}, Z={z}, RCODE={rcode}\n")
                             
                             # Counters
-
                             qdcount = int.from_bytes(payload_data[4:6], byteorder='big')
                             ancount = int.from_bytes(payload_data[6:8], byteorder='big')
                             nscount = int.from_bytes(payload_data[8:10], byteorder='big')
@@ -7765,11 +8963,9 @@ class NetworkAnalyzer:
                             payload_text.insert(tk.END, f"Questions: {qdcount}, Answers: {ancount}, NS: {nscount}, AR: {arcount}\n\n")
                             
                             # Try to extract the domain name (simplified)
-
                             if qdcount > 0:
                                 try:
                                     # Start after the header
-
                                     pos = 12
                                     domain_parts = []
                                     
@@ -7787,7 +8983,6 @@ class NetworkAnalyzer:
                                     payload_text.insert(tk.END, f"Domain requesto: {domain}\n", "highlight")
                                     
                                     # Type of record
-
                                     qtype = int.from_bytes(payload_data[pos:pos+2], byteorder='big')
                                     qtypes = {1: "A", 2: "NS", 5: "CNAME", 15: "MX", 16: "TXT", 28: "AAAA"}
                                     qtype_str = qtypes.get(qtype, str(qtype))
@@ -7815,18 +9010,90 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, f"Message: {type_str}, Code: {icmp_code}\n\n")
                     
                     # For Echo Request/Reply, it shows the identifier and the sequence
-
                     if icmp_type in [0, 8] and len(payload_data) >= 4:
                         identifier = int.from_bytes(payload_data[0:2], byteorder='big')
                         sequence = int.from_bytes(payload_data[2:4], byteorder='big')
                         payload_text.insert(tk.END, f"Identifier: {identifier}, Sequence: {sequence}\n")
                 
-                # View as a text
+                # NUOVO: Analisi AI del contenuto se Ollama è disponibile
+                if hasattr(self, 'ollama_validator') and hasattr(self, 'use_ollama') and self.use_ollama:
+                    payload_text.insert(tk.END, "\n\n=== AI DEEP ANALYSIS ===\n", "header")
+                    payload_text.insert(tk.END, "Analyzing packet content with AI...\n", "ai_analysis")
+                    
+                    # Prepara prompt per analisi approfondita
+                    deep_analysis_prompt = f"""<role>
+    You are a security expert analyzing a network packet flagged as: {threat_type}
+    The severity has been determined as: {severity}
 
+    Packet Information:
+    - Protocol: {proto_name}
+    - Source: {src_ip}:{threat_packet.get('sport', 'N/A')}
+    - Destination: {dst_ip}:{threat_packet.get('dport', 'N/A')}
+    - Size: {len(payload_data)} bytes
+    - Severity: {severity}
+
+    Payload Preview (first 256 bytes as hex):
+    {payload_data[:256].hex()}
+
+    ASCII representation:
+    {''.join(chr(b) if 32 <= b < 127 else '.' for b in payload_data[:256])}
+    </role>
+
+    <task>
+    Provide a security analysis CONSISTENT with {severity} severity:
+    1. What specific activity does this represent?
+    2. What are the indicators observed?
+    3. What is the potential impact?
+    4. Are there any patterns or signatures?
+
+    Your analysis must align with the {severity} severity level.
+    </task>
+
+    Format as JSON:
+    {{
+    "activity_type": "specific activity identification",
+    "indicators": ["indicator1", "indicator2"],
+    "impact": "potential impact for {severity} severity",
+    "patterns": "any patterns found",
+    "technical_details": "technical analysis"
+    }}"""
+
+                    try:
+                        response = requests.post(
+                            self.ollama_validator.api_endpoint,
+                            json={
+                                "model": self.ollama_validator.model_name,
+                                "prompt": deep_analysis_prompt,
+                                "stream": False,
+                                "format": "json"
+                            },
+                            timeout=30
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            ai_analysis = json.loads(result.get('response', '{}'))
+                            
+                            payload_text.insert(tk.END, f"\nActivity Type: {ai_analysis.get('activity_type', 'Unknown')}\n", "ai_analysis")
+                            
+                            if ai_analysis.get('indicators'):
+                                payload_text.insert(tk.END, "\nIndicators Observed:\n", "subheader")
+                                for indicator in ai_analysis['indicators']:
+                                    payload_text.insert(tk.END, f"• {indicator}\n", "ai_analysis")
+                            
+                            if ai_analysis.get('patterns'):
+                                payload_text.insert(tk.END, f"\nPatterns Identified: {ai_analysis['patterns']}\n", "ai_analysis")
+                            
+                            if ai_analysis.get('technical_details'):
+                                payload_text.insert(tk.END, f"\nTechnical Analysis: {ai_analysis['technical_details']}\n", "ai_analysis")
+                    
+                    except Exception as e:
+                        payload_text.insert(tk.END, f"\nAI analysis error: {str(e)}\n", "ai_analysis")
+                
+                # View as a text
                 payload_text.insert(tk.END, "\n\n=== CONTENT AS TEXT ===\n", "header")
                 try:
                     # Try different codes
-
                     encodings = ['utf-8', 'ascii', 'latin-1', 'windows-1252']
                     decoded = False
                     
@@ -7842,63 +9109,52 @@ class NetworkAnalyzer:
                     
                     if not decoded:
                         # Fallback a replace
-
                         payload_str = payload_data.decode('utf-8', errors='replace')
                         payload_text.insert(tk.END, "\nUnable to decode with standard encoding, monster with character substitution:\n\n", "subheader")
                         payload_text.insert(tk.END, payload_str)
                 except Exception as e:
                     payload_text.insert(tk.END, f"\nError in decoding: {str(e)}\n")
                 
-                # View as Hex with interpretation
-
+                # View as Hex with interpretation (NON MODIFICATO COME RICHIESTO)
                 payload_text.insert(tk.END, "\n\n=== CONTENT AS HEX ===\n", "header")
                 
                 # Format the hexadecimal dump
-
                 addr = 0
                 while addr < len(payload_data):
                     line_data = payload_data[addr:addr+16]
                     hex_data = ' '.join(f'{b:02x}' for b in line_data)
                     
                     # Pad with spaces to align the ASCII part
-
                     if len(line_data) < 16:
                         hex_data += '   ' * (16 - len(line_data))
                     
                     # ASCII part
-
                     ascii_data = ''.join(chr(b) if 32 <= b < 127 else '.' for b in line_data)
                     
                     # Insert with formatting
-
                     payload_text.insert(tk.END, f'{addr:04x}  ', "addr")
                     payload_text.insert(tk.END, f'{hex_data}  ', "hex")
                     payload_text.insert(tk.END, f'|{ascii_data}|\n', "ascii")
                     addr += 16
                 
                 # Add a section for the advanced interpretation of hexadecimal data
-
                 payload_text.insert(tk.END, "\n\n=== ADVANCED INTERPRETING ===\n", "header")
                 
                 # Search common patterns in data
                 # 1. ASCII string
-
                 payload_text.insert(tk.END, "\nASCII strings detected:\n", "subheader")
                 ascii_strings = []
                 current_string = ""
                 
                 for byte in payload_data:
                     if 32 <= byte < 127:  # Printed ascii character
-
                         current_string += chr(byte)
                     else:
                         if len(current_string) >= 4:  # Only strings of at least 4 characters
-
                             ascii_strings.append(current_string)
                         current_string = ""
                 
                 # Add the last string if present
-
                 if len(current_string) >= 4:
                     ascii_strings.append(current_string)
                 
@@ -7909,12 +9165,10 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, "No significant ASCII strings detected.\n")
                 
                 # 2. IP addresses
-
                 payload_text.insert(tk.END, "\nPossible IP addresses:\n", "subheader")
                 found_ips = False
                 
                 # Search for IPV4 addresses patterns
-
                 for i in range(len(payload_data) - 3):
                     if all(0 <= b <= 255 for b in payload_data[i:i+4]):
                         ip_addr = '.'.join(str(b) for b in payload_data[i:i+4])
@@ -7925,17 +9179,14 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, "No possible IPv4 address detected.\n")
                 
                 # 3. Timestamp
-
                 payload_text.insert(tk.END, "\nPossible timestamps:\n", "subheader")
                 found_timestamps = False
                 
                 # Cerca timestamp UNIX a 32 bit
-
                 for i in range(0, len(payload_data) - 3, 4):
                     try:
                         timestamp_value = int.from_bytes(payload_data[i:i+4], byteorder='little')
                         # Reasonable timestamp between 2000 and 2030
-
                         if 946684800 <= timestamp_value <= 1893456000:
                             timestamp_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp_value))
                             payload_text.insert(tk.END, f"Offset 0x{i:04x}: {timestamp_date} (Unix: {timestamp_value})\n")
@@ -7947,7 +9198,6 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, "No UNIX timestamps detected.\n")
                 
                 # 4. File formats
-
                 payload_text.insert(tk.END, "\nFile signatures detected:\n", "subheader")
                 file_signatures = {
                     b'PK\x03\x04': 'ZIP archive',
@@ -7981,7 +9231,6 @@ class NetworkAnalyzer:
                     payload_text.insert(tk.END, "No file signatures detected.\n")
                 
                 # 5. Specific analysis based on the type of threat
-
                 if "SQL Injection" in threat_type:
                     payload_text.insert(tk.END, "\nSQL Injection Analysis:\n", "subheader")
                     try:
@@ -7993,9 +9242,7 @@ class NetworkAnalyzer:
                             r'UNION\s+SELECT',
                             r'DROP\s+TABLE',
                             r'--\s',  # SQL comment
-
                             r'/\*.*?\*/',  # SQL block comment
-
                             r'1=1',
                             r'OR\s+\d+=\d+',
                             r'EXEC\s+xp_'
@@ -8023,10 +9270,10 @@ class NetworkAnalyzer:
                             r'onload=',
                             r'onclick=',
                             r'onmouseover=',
-                            r'eval\(',
+                            r'evalKATEX_INLINE_OPEN',
                             r'document\.cookie',
-                            r'alert\(',
-                            r'String\.fromCharCode\(',
+                            r'alertKATEX_INLINE_OPEN',
+                            r'String\.fromCharCodeKATEX_INLINE_OPEN',
                             r'<img[^>]*src=[^>]*>'
                         ]
                         
@@ -8046,12 +9293,10 @@ class NetworkAnalyzer:
                 payload_text.insert(tk.END, "Control packets or some types of protocol packets often do not contain data.")
 
             # Details for details
-
             details_frame = ttk.Frame(notebook)
             notebook.add(details_frame, text="Package Details")
 
             # Treeview for details
-
             details_tree = ttk.Treeview(details_frame, columns=("Field", "Value"), show="headings")
             details_tree.heading("Field", text="Field")
             details_tree.heading("Value", text="Value")
@@ -8060,13 +9305,11 @@ class NetworkAnalyzer:
             details_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
             # Scrollbar
-
             scrollbar = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=details_tree.yview)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             details_tree.configure(yscrollcommand=scrollbar.set)
 
             # Populate the details
-
             for key, value in sorted(threat_packet.items()):
                 if key in ['raw', 'payload']:
                     if key == 'payload' and value:
@@ -8074,7 +9317,6 @@ class NetworkAnalyzer:
                     continue
                 
                 # Format the value
-
                 if isinstance(value, bytes):
                     formatted_value = f"[{len(value)} bytes]"
                 else:
@@ -8082,28 +9324,197 @@ class NetworkAnalyzer:
                 
                 details_tree.insert("", "end", values=(key, formatted_value))
 
-            # Recommendation sheet
-
+            # Recommendation sheet - MIGLIORATO CON OLLAMA
             recommendations_frame = ttk.Frame(notebook)
             notebook.add(recommendations_frame, text="Recommendations")
 
             # Text Widget for Recommendations
-
             recommendations_text = scrolledtext.ScrolledText(recommendations_frame, wrap=tk.WORD, height=20, font=("Arial", 10))
             recommendations_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
             # Add tags for formatting
-
             recommendations_text.tag_configure("header", font=("Arial", 12, "bold"), foreground="blue")
             recommendations_text.tag_configure("subheader", font=("Arial", 11, "bold"), foreground="dark blue")
             recommendations_text.tag_configure("important", foreground="red")
+            recommendations_text.tag_configure("ai_recommendation", foreground="#006400", font=("Arial", 10))
+            recommendations_text.tag_configure("low_priority", foreground="#696969", font=("Arial", 10, "italic"))
 
             # Add recommendations based on the type of threat
-
             recommendations_text.insert(tk.END, "SAFETY RECOMMENDATIONS\n\n", "header")
 
-            # Specific recommendations by type of threat
+            # USA OLLAMA PER RACCOMANDAZIONI PERSONALIZZATE
+            if hasattr(self, 'ollama_validator') and hasattr(self, 'use_ollama') and self.use_ollama:
+                recommendations_text.insert(tk.END, f"AI-Generated Recommendations for {severity} Severity:\n\n", "subheader")
+                
+                # Definisci le azioni richieste in base alla severità
+                severity_requirements = {
+                    "Low": {
+                        "immediate": False,
+                        "timeline": "Review within 1-2 weeks",
+                        "urgency": "routine monitoring"
+                    },
+                    "Medium": {
+                        "immediate": False,
+                        "timeline": "Investigate within 24-48 hours",
+                        "urgency": "scheduled investigation"
+                    },
+                    "High": {
+                        "immediate": True,
+                        "timeline": "Immediate action required",
+                        "urgency": "urgent response"
+                    },
+                    "Critical": {
+                        "immediate": True,
+                        "timeline": "Emergency response required",
+                        "urgency": "emergency"
+                    }
+                }
+                
+                severity_info = severity_requirements.get(severity, severity_requirements["Medium"])
+                
+                recommendations_prompt = f"""<role>
+    You are a cybersecurity expert providing remediation recommendations.
+    You MUST provide recommendations appropriate for {severity} severity level.
+    </role>
 
+    <severity_requirements>
+    Severity Level: {severity}
+    Immediate Action Required: {severity_info['immediate']}
+    Timeline: {severity_info['timeline']}
+    Urgency Level: {severity_info['urgency']}
+    </severity_requirements>
+
+    <threat_details>
+    - Type: {threat_type}
+    - Source: {src_ip}
+    - Destination: {dst_ip}
+    - Protocol: {threat_packet.get('proto_name', 'Unknown')}
+    - Ports: {threat_packet.get('sport', 'N/A')} -> {threat_packet.get('dport', 'N/A')}
+    </threat_details>
+
+    <task>
+    Generate recommendations STRICTLY appropriate for {severity} severity:
+
+    For LOW severity:
+    - Focus on logging and monitoring
+    - No immediate actions
+    - Preventive long-term measures
+
+    For MEDIUM severity:
+    - Investigation steps within 24-48 hours
+    - Enhanced monitoring
+    - Targeted preventive measures
+
+    For HIGH severity:
+    - Immediate containment actions
+    - Rapid investigation steps
+    - Critical preventive measures
+
+    For CRITICAL severity:
+    - Emergency response procedures
+    - Immediate isolation and containment
+    - Incident response team activation
+    </task>
+
+    Format as JSON:
+    {{
+    "immediate_actions": [list only if severity is High/Critical, otherwise empty],
+    "investigation_steps": [appropriate to severity timeline],
+    "monitoring_actions": [always include],
+    "preventive_measures": [long-term improvements],
+    "tools_commands": [specific tools relevant to severity],
+    "detection_rules": [appropriate monitoring rules],
+    "estimated_time": "{severity_info['timeline']}"
+    }}"""
+
+                try:
+                    response = requests.post(
+                        self.ollama_validator.api_endpoint,
+                        json={
+                            "model": self.ollama_validator.model_name,
+                            "prompt": recommendations_prompt,
+                            "stream": False,
+                            "format": "json"
+                        },
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        ai_recommendations = json.loads(result.get('response', '{}'))
+                        
+                        # Mostra il livello di priorità basato sulla severità
+                        severity_colors = {
+                            "Low": ("📌 LOW PRIORITY - ", "low_priority"),
+                            "Medium": ("⚡ MEDIUM PRIORITY - ", "subheader"),
+                            "High": ("🚨 HIGH PRIORITY - ", "important"),
+                            "Critical": ("🔴 CRITICAL - ", "important")
+                        }
+                        
+                        prefix, tag = severity_colors.get(severity, ("", "subheader"))
+                        recommendations_text.insert(tk.END, f"{prefix}{severity_info['timeline'].upper()}\n\n", tag)
+                        
+                        # Azioni immediate (solo per High/Critical)
+                        if ai_recommendations.get('immediate_actions') and severity in ["High", "Critical"]:
+                            recommendations_text.insert(tk.END, "🚨 IMMEDIATE ACTIONS:\n", "important")
+                            for i, action in enumerate(ai_recommendations['immediate_actions'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {action}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        elif severity == "Low":
+                            recommendations_text.insert(tk.END, "✓ No immediate action required for Low severity\n\n", "low_priority")
+                        
+                        # Steps di investigazione
+                        if ai_recommendations.get('investigation_steps'):
+                            timeline_text = {
+                                "Low": "INVESTIGATION (When convenient):",
+                                "Medium": "INVESTIGATION (Within 24-48 hours):",
+                                "High": "URGENT INVESTIGATION:",
+                                "Critical": "EMERGENCY INVESTIGATION:"
+                            }
+                            recommendations_text.insert(tk.END, f"🔍 {timeline_text.get(severity, 'INVESTIGATION:')}\n", "subheader")
+                            for i, step in enumerate(ai_recommendations['investigation_steps'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {step}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        
+                        # Azioni di monitoraggio
+                        if ai_recommendations.get('monitoring_actions'):
+                            recommendations_text.insert(tk.END, "📊 MONITORING ACTIONS:\n", "subheader")
+                            for i, action in enumerate(ai_recommendations['monitoring_actions'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {action}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        
+                        # Misure preventive
+                        if ai_recommendations.get('preventive_measures'):
+                            recommendations_text.insert(tk.END, "🛡️ PREVENTIVE MEASURES:\n", "subheader")
+                            for i, measure in enumerate(ai_recommendations['preventive_measures'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {measure}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        
+                        # Tools e comandi
+                        if ai_recommendations.get('tools_commands'):
+                            recommendations_text.insert(tk.END, "🔧 TOOLS & COMMANDS:\n", "subheader")
+                            for i, cmd in enumerate(ai_recommendations['tools_commands'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {cmd}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        
+                        # Regole di detection
+                        if ai_recommendations.get('detection_rules'):
+                            recommendations_text.insert(tk.END, "📡 DETECTION RULES:\n", "subheader")
+                            for i, rule in enumerate(ai_recommendations['detection_rules'], 1):
+                                recommendations_text.insert(tk.END, f"{i}. {rule}\n", "ai_recommendation")
+                            recommendations_text.insert(tk.END, "\n")
+                        
+                        # Timeline stimata
+                        recommendations_text.insert(tk.END, f"⏱️ Estimated Response Time: {ai_recommendations.get('estimated_time', severity_info['timeline'])}\n\n", "subheader")
+                        
+                except Exception as e:
+                    recommendations_text.insert(tk.END, f"Error generating AI recommendations: {str(e)}\n\n")
+                    # Fallback alle raccomandazioni standard
+            
+            # Raccomandazioni standard come fallback
+            recommendations_text.insert(tk.END, "\nStandard Recommendations by Threat Type:\n", "subheader")
+            
+            # Specific recommendations by type of threat (codice esistente mantenuto)
             if "SQL Injection" in threat_type:
                 recommendations_text.insert(tk.END, "To prevent SQL Injection attacks:\n\n", "subheader")
                 recommendations_text.insert(tk.END, "1. Always use prepared statements or parameterized procedures\n")
@@ -8111,8 +9522,9 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk. END, "3. Use a Web Application Firewall (WAF)\n")
                 recommendations_text.insert(tk. END, "4. Enforce the principle of least privilege for database accounts\n")
                 recommendations_text.insert(tk. END, "5. Run vulnerability scanners regularly\n\n")
-                recommendations_text.insert(tk. END, "IMMEDIATE ACTION:", "important")
-                recommendations_text.insert(tk. END, "Test the application code that handles this endpoint and make sure it uses prepared statements.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk. END, "IMMEDIATE ACTION:", "important")
+                    recommendations_text.insert(tk. END, " Test the application code that handles this endpoint and make sure it uses prepared statements.\n")
 
             elif "XSS" in threat_type:
                 recommendations_text.insert(tk.END, "To prevent Cross-Site Scripting (XSS) attacks:\n\n", "subheader")
@@ -8121,8 +9533,9 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "3. Strictly validates all server-side inputs\n")
                 recommendations_text.insert(tk.END, "4. Use modern libraries that handle escaping automatically\n")
                 recommendations_text.insert(tk.END, "5. Set cookies as HttpOnly to prevent theft via JavaScript\n\n")
-                recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Implement Content-Security-Policy and verify the sanitization of inputs in the application.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Implement Content-Security-Policy and verify the sanitization of inputs in the application.\n")
 
             elif "Port Scan" in threat_type:
                 recommendations_text.insert(tk.END, "To protect your system from port scanning:\n\n", "subheader")
@@ -8131,8 +9544,9 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "3. Consider using non-standard ports for critical services\n")
                 recommendations_text.insert(tk.END, "4. Disable all unnecessary services\n")
                 recommendations_text.insert(tk.END, "5. Implement rate limiting for connections from single IPs\n\n")
-                recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Verify the firewall configuration and block the source IP if suspicious activity continues.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Verify the firewall configuration and block the source IP if suspicious activity continues.\n")
 
             elif "DoS" in threat_type or "DDoS" in threat_type:
                 recommendations_text.insert(tk.END, "To mitigate denial of service attacks:\n\n", "subheader")
@@ -8141,8 +9555,9 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "3. Configure appropriate timeouts on servers\n")
                 recommendations_text.insert(tk.END, "4. Deploy infrastructure across multiple data centers\n")
                 recommendations_text.insert(tk.END, "5. Implement auto-scaling systems to handle traffic spikes\n\n")
-                recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Set up rate limiting rules on your firewall and contact your network provider if the attack persists.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Set up rate limiting rules on your firewall and contact your network provider if the attack persists.\n")
             
             elif "Malware" in threat_type:
                 recommendations_text.insert(tk.END, "To deal with potential malware infections:\n\n", "subheader")
@@ -8151,8 +9566,9 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "3. Implement an Endpoint Detection and Response (EDR) solution\n")
                 recommendations_text.insert(tk.END, "4. Configure stricter security policies\n")
                 recommendations_text.insert(tk.END, "5. Consider temporarily isolating compromised systems\n\n")
-                recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Isolate the affected system from the network and start a thorough virus scan.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Isolate the affected system from the network and start a thorough virus scan.\n")
             
             elif "Data Exfiltration" in threat_type:
                 recommendations_text.insert(tk.END, "To prevent data exfiltration:\n\n", "subheader")
@@ -8161,12 +9577,12 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "3. Segment your network to restrict access to sensitive data\n")
                 recommendations_text.insert(tk.END, "4. Monitor and limit the use of unauthorized cloud storage services\n")
                 recommendations_text.insert(tk.END, "5. Implement least-privilege access controls\n\n")
-                recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Check what data may have been compromised and block the suspicious destination IP.\n")
+                if severity in ["High", "Critical"]:
+                    recommendations_text.insert(tk.END, "IMMEDIATE ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Check what data may have been compromised and block the suspicious destination IP.\n")
             
             else:
                 # Generic recommendations
-
                 recommendations_text.insert(tk.END, "General Safety Recommendations:\n\n", "subheader")
                 recommendations_text.insert(tk.END, "1. Keep all systems and applications up to date\n")
                 recommendations_text.insert(tk.END, "2. Implement a properly configured firewall\n")
@@ -8175,15 +9591,17 @@ class NetworkAnalyzer:
                 recommendations_text.insert(tk.END, "5. Implement multi-factor authentication where possible\n")
                 recommendations_text.insert(tk.END, "6. Segment your network to limit threat propagation\n")
                 recommendations_text.insert(tk.END, "7. Regularly monitors system and network logs\n\n")
-                recommendations_text.insert(tk.END, "RECOMMENDED ACTION: ", "important")
-                recommendations_text.insert(tk.END, "Further analyze this threat to determine its origin and potential impact.\n")
+                if severity == "Low":
+                    recommendations_text.insert(tk.END, "ACTION: ", "low_priority")
+                    recommendations_text.insert(tk.END, "Log this event for future correlation. No immediate action required.\n")
+                else:
+                    recommendations_text.insert(tk.END, "RECOMMENDED ACTION: ", "important")
+                    recommendations_text.insert(tk.END, "Further analyze this threat to determine its origin and potential impact.\n")
             
             # Add context information
-
             recommendations_text.insert(tk.END, "\nADDITIONAL INFORMATION\n", "subheader")
             
             # Check if the source ip is known
-
             src_info = "No information available"
             if hasattr(self, 'threat_db') and 'ip' in self.threat_db:
                 if src_ip in self.threat_db['ip']:
@@ -8194,7 +9612,6 @@ class NetworkAnalyzer:
             recommendations_text.insert(tk.END, f"\nSource IP Information ({src_ip}):\n{src_info}\n\n")
             
             # Check if there are notes involved doors
-
             if 'sport' in threat_packet and 'dport' in threat_packet:
                 sport = threat_packet['sport']
                 dport = threat_packet['dport']
@@ -8213,259 +9630,1047 @@ class NetworkAnalyzer:
                     recommendations_text.insert(tk.END, f"Port Information:\n{port_info}\n")
             
             # Buttons
-
             button_frame = ttk.Frame(main_frame)
             button_frame.pack(fill=tk.X, pady=(10, 0))
             
             # Button to export
-
             export_btn = ttk.Button(button_frame, text="Export Report", 
                                 command=lambda: self.export_threat_report(threat_packet, threat_type, severity))
             export_btn.pack(side=tk.LEFT, padx=5)
             
             # Button to copy payload
-
             copy_btn = ttk.Button(button_frame, text="Copy Payload",
                             command=lambda: self.copy_to_clipboard(payload_data))
             copy_btn.pack(side=tk.LEFT, padx=5)
             
             # Button to close
-
             close_btn = ttk.Button(button_frame, text="Close", command=details_window.destroy)
             close_btn.pack(side=tk.RIGHT, padx=5)
             
         except Exception as e:
             # Errors management
-
             import traceback
             print(f"Errore in show_threat_details: {str(e)}")
             print(traceback.format_exc())
             messagebox.showerror("Error", f"An error occurred while viewing details: {str(e)}")
 
     def copy_to_clipboard(self, data):
-        """Copy data to clipboard"""
+        """Copy data to clipboard with proper handling of special characters"""
         try:
-            # If it is bytes, convert to string
-
+            # Convert and sanitize data
             if isinstance(data, bytes):
-                # Try first as a text
-
-                try:
-                    clipboard_text = data.decode('utf-8', errors='replace')
-                except:
-                    # Fallback with hexadecimal representation
-
-                    clipboard_text = ' '.join(f'{b:02x}' for b in data)
+                # Offri opzioni per bytes
+                choice_window = tk.Toplevel(self.root)
+                choice_window.title("Copy Format")
+                choice_window.geometry("300x150")
+                choice_window.transient(self.root)
+                choice_window.grab_set()
+                
+                selected_format = tk.StringVar(value="hex")
+                
+                frame = ttk.Frame(choice_window, padding=20)
+                frame.pack(fill=tk.BOTH, expand=True)
+                
+                ttk.Label(frame, text="Select copy format:").pack()
+                ttk.Radiobutton(frame, text="Hexadecimal", variable=selected_format, value="hex").pack()
+                ttk.Radiobutton(frame, text="Base64", variable=selected_format, value="base64").pack()
+                ttk.Radiobutton(frame, text="Sanitized Text", variable=selected_format, value="text").pack()
+                
+                clipboard_text = None
+                
+                def process_choice():
+                    nonlocal clipboard_text
+                    fmt = selected_format.get()
+                    
+                    if fmt == "hex":
+                        clipboard_text = ' '.join(f'{b:02x}' for b in data)
+                    elif fmt == "base64":
+                        import base64
+                        clipboard_text = base64.b64encode(data).decode('ascii')
+                    else:  # sanitized text
+                        clipboard_text = self.sanitize_for_clipboard(data)
+                    
+                    choice_window.destroy()
+                
+                ttk.Button(frame, text="OK", command=process_choice).pack(pady=10)
+                choice_window.wait_window()
+                
+                if clipboard_text is None:
+                    return
             else:
-                clipboard_text = str(data)
+                # Sanitizza stringhe normali
+                clipboard_text = self.sanitize_string_for_clipboard(str(data))
             
-            # Copy in the notes
-
-            self.root.clipboard_clear()
-            self.root.clipboard_append(clipboard_text)
-            messagebox.showinfo("Copy", "Data copied to clipboard")
+            # Metodo 1: Usa pyperclip se disponibile
+            try:
+                import pyperclip
+                pyperclip.copy(clipboard_text)
+                messagebox.showinfo("Success", "Data copied to clipboard")
+                return
+            except ImportError:
+                pass
+            
+            # Metodo 2: Platform-specific con gestione caratteri speciali
+            import subprocess
+            import platform
+            
+            system = platform.system()
+            success = False
+            
+            if system == 'Windows':
+                try:
+                    # Windows clip.exe con encoding corretto
+                    process = subprocess.Popen(
+                        ['clip'], 
+                        stdin=subprocess.PIPE, 
+                        shell=True
+                    )
+                    process.communicate(clipboard_text.encode('utf-8', errors='replace'))
+                    success = True
+                except:
+                    pass
+                    
+            elif system == 'Darwin':
+                try:
+                    # macOS pbcopy
+                    process = subprocess.Popen(
+                        ['pbcopy'], 
+                        stdin=subprocess.PIPE
+                    )
+                    process.communicate(clipboard_text.encode('utf-8', errors='replace'))
+                    success = True
+                except:
+                    pass
+                    
+            elif system == 'Linux':
+                try:
+                    # Linux xclip con encoding UTF-8
+                    process = subprocess.Popen(
+                        ['xclip', '-selection', 'clipboard'], 
+                        stdin=subprocess.PIPE
+                    )
+                    process.communicate(clipboard_text.encode('utf-8', errors='replace'))
+                    success = True
+                except:
+                    try:
+                        # Fallback a xsel
+                        process = subprocess.Popen(
+                            ['xsel', '--clipboard', '--input'], 
+                            stdin=subprocess.PIPE
+                        )
+                        process.communicate(clipboard_text.encode('utf-8', errors='replace'))
+                        success = True
+                    except:
+                        pass
+            
+            if success:
+                messagebox.showinfo("Success", "Data copied to clipboard")
+                return
+            
+            # Metodo 3: Tkinter con testo sanitizzato
+            try:
+                # Rimuovi tutti i caratteri di controllo problematici
+                safe_text = ''.join(
+                    char if ord(char) >= 32 or char in '\n\r\t' else '�' 
+                    for char in clipboard_text
+                )
+                
+                self.root.clipboard_clear()
+                self.root.clipboard_append(safe_text)
+                self.root.update()
+                self.root.update_idletasks()
+                
+                # Verifica
+                try:
+                    test = self.root.clipboard_get()
+                    if test:
+                        messagebox.showinfo("Success", "Data copied to clipboard (sanitized)")
+                        return
+                except:
+                    pass
+            except:
+                pass
+            
+            # Se tutto fallisce, mostra finestra per copia manuale
+            self.show_copy_dialog_safe(clipboard_text)
+            
         except Exception as e:
-            messagebox.showerror("Error", f"Unable to copy to clipboard: {str(e)}")       
+            messagebox.showerror("Error", f"Unable to copy: {str(e)}")
+
+    def sanitize_for_clipboard(self, data):
+        """Convert bytes to sanitized string safe for clipboard"""
+        result = []
+        for byte in data:
+            if 32 <= byte < 127:  # Caratteri ASCII stampabili
+                result.append(chr(byte))
+            elif byte == 9:  # Tab
+                result.append('\t')
+            elif byte == 10:  # Newline
+                result.append('\n')
+            elif byte == 13:  # Carriage return
+                result.append('\r')
+            else:
+                # Sostituisci caratteri non stampabili con notazione hex
+                result.append(f'\\x{byte:02x}')
+        return ''.join(result)
+
+    def sanitize_string_for_clipboard(self, text):
+        """Sanitize string removing problematic characters"""
+        # Rimuovi caratteri NULL che possono troncare la stringa
+        text = text.replace('\x00', '\\x00')
+        
+        # Sostituisci altri caratteri di controllo problematici
+        sanitized = []
+        for char in text:
+            code = ord(char)
+            if code >= 32 or char in '\n\r\t':
+                sanitized.append(char)
+            elif code < 32:
+                sanitized.append(f'\\x{code:02x}')
+            else:
+                sanitized.append('�')
+        
+        return ''.join(sanitized)
+
+    def show_copy_dialog_safe(self, text):
+        """Show dialog with multiple format options"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Copy Data")
+        dialog.geometry("700x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Tab 1: Testo sanitizzato
+        text_frame = ttk.Frame(notebook)
+        notebook.add(text_frame, text="Sanitized Text")
+        
+        text_widget = tk.Text(text_frame, wrap=tk.WORD)
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Inserisci testo sanitizzato
+        safe_text = ''.join(
+            char if ord(char) >= 32 or char in '\n\r\t' else f'[{ord(char):02x}]' 
+            for char in text
+        )
+        text_widget.insert(1.0, safe_text)
+        
+        # Tab 2: Hex
+        hex_frame = ttk.Frame(notebook)
+        notebook.add(hex_frame, text="Hexadecimal")
+        
+        hex_widget = tk.Text(hex_frame, wrap=tk.WORD)
+        hex_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Converti in hex
+        hex_text = ' '.join(f'{ord(c):02x}' for c in text)
+        hex_widget.insert(1.0, hex_text)
+        
+        # Tab 3: Base64
+        base64_frame = ttk.Frame(notebook)
+        notebook.add(base64_frame, text="Base64")
+        
+        base64_widget = tk.Text(base64_frame, wrap=tk.WORD)
+        base64_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Converti in base64
+        import base64
+        b64_text = base64.b64encode(text.encode('utf-8', errors='replace')).decode('ascii')
+        base64_widget.insert(1.0, b64_text)
+        
+        # Seleziona tutto nel primo tab
+        text_widget.tag_add(tk.SEL, "1.0", tk.END)
+        text_widget.focus()
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        def copy_current_tab():
+            current_tab = notebook.index(notebook.select())
+            if current_tab == 0:
+                content = text_widget.get(1.0, tk.END).strip()
+            elif current_tab == 1:
+                content = hex_widget.get(1.0, tk.END).strip()
+            else:
+                content = base64_widget.get(1.0, tk.END).strip()
+            
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(content)
+                self.root.update()
+                messagebox.showinfo("Success", "Content copied!")
+            except:
+                messagebox.showerror("Error", "Failed to copy. Use Ctrl+C")
+        
+        ttk.Button(button_frame, text="Copy Current Tab", command=copy_current_tab).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def show_copy_dialog(self, text):
+        """Show a dialog with selectable text for manual copying"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Manual Copy")
+        dialog.geometry("600x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="Automatic copy failed. Please copy manually (Ctrl+C):").pack()
+        
+        # Text widget con scrollbar
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, yscrollcommand=scrollbar.set)
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+        
+        # Inserisci il testo
+        text_widget.insert(1.0, text)
+        
+        # Seleziona tutto automaticamente
+        text_widget.tag_add(tk.SEL, "1.0", tk.END)
+        text_widget.mark_set(tk.INSERT, "1.0")
+        text_widget.see(tk.INSERT)
+        text_widget.focus()
+        
+        # Binding per Ctrl+A (seleziona tutto)
+        def select_all(event):
+            text_widget.tag_add(tk.SEL, "1.0", tk.END)
+            text_widget.mark_set(tk.INSERT, "1.0")
+            text_widget.see(tk.INSERT)
+            return "break"
+        
+        text_widget.bind("<Control-a>", select_all)
+        text_widget.bind("<Control-A>", select_all)
+        
+        # Pulsanti
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(fill=tk.X)
+        
+        # Prova a copiare di nuovo quando si preme il pulsante
+        def retry_copy():
+            try:
+                selected_text = text_widget.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected_text)
+                self.root.update()
+                messagebox.showinfo("Success", "Text copied! Try pasting now.")
+            except:
+                messagebox.showerror("Error", "Still unable to copy. Please use Ctrl+C")
+        
+        ttk.Button(button_frame, text="Retry Copy", command=retry_copy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side=tk.RIGHT, padx=5) 
 
     def export_threat_report(self, packet, threat_type, severity):
-        """Export a detailed threat report with path traversal protection"""
+        """Export a professional threat report with AI-enhanced analysis"""
         try:
-            # Ask the user where to save the file
-
+            # Ask format preference
+            format_window = tk.Toplevel(self.root)
+            format_window.title("Select Report Format")
+            format_window.geometry("300x150")
+            format_window.transient(self.root)
+            format_window.grab_set()
+            
+            selected_format = tk.StringVar(value="html")
+            
+            frame = ttk.Frame(format_window, padding=20)
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            ttk.Label(frame, text="Select report format:").pack()
+            ttk.Radiobutton(frame, text="HTML (Professional)", variable=selected_format, value="html").pack()
+            ttk.Radiobutton(frame, text="Text (Simple)", variable=selected_format, value="txt").pack()
+            ttk.Radiobutton(frame, text="JSON (Technical)", variable=selected_format, value="json").pack()
+            
+            def proceed():
+                format_window.destroy()
+            
+            ttk.Button(frame, text="Continue", command=proceed).pack(pady=10)
+            format_window.wait_window()
+            
+            # Ask where to save
+            file_ext = selected_format.get()
             file_path = filedialog.asksaveasfilename(
-                defaultextension=".txt",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                defaultextension=f".{file_ext}",
+                filetypes=[
+                    ("HTML files", "*.html") if file_ext == "html" else
+                    ("JSON files", "*.json") if file_ext == "json" else
+                    ("Text files", "*.txt"),
+                    ("All files", "*.*")
+                ],
                 title="Save threat report"
             )
             
             if not file_path:
                 return
             
-            # Sanitize file path -protect against path traversal
-
-            file_path = os.path.abspath(file_path)
-            if not file_path.endswith(('.txt', '.TXT')):
-                file_path += '.txt'  # Ensure it has a safe extension
-
-            
-            # Check if directory exists and is writable
-
-            save_dir = os.path.dirname(file_path)
-            if not os.path.exists(save_dir):
-                messagebox.showerror("Error", f"Destination directory does not exist: {save_dir}")
-                return
-                
-            if not os.access(save_dir, os.W_OK):
-                messagebox.showerror("Error", f"Insufficient write permissions in: {save_dir}")
-                return
-            
-            # Create the contents of the report
-
-            report = []
-            report.append("=" * 80)
-            report.append(f"THREAT REPORT: {threat_type}")
-            report.append("=" * 80)
-            report.append("")
-            report.append(f"Date/Now: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            report.append(f"Severity: {severity}")
-            report.append("")
-            report.append("PACKAGE INFORMATION")
-            report.append("-" * 40)
-            report.append(f"Timestamp: {time.strftime('%H:%M:%S', time.localtime(packet['time']))}")
-            report.append(f"Source IP: {packet['src']}")
-            report.append(f"Destination IP: {packet['dst']}")
-            report.append(f"Protocol: {packet.get('proto_name', 'Unknown')}")
-            
-            if 'sport' in packet:
-                report.append(f"Source Port: {packet['sport']}")
-            if 'dport' in packet:
-                report.append(f"Destination Port: {packet['dport']}")
-            
-            report.append(f"Package size: {packet['len']} bytes")
-            report.append("")
-            
-            # Add information on the threat database
-
-            report.append("THREAT DETAILS")
-            report.append("-" * 40)
-            
-            threat_found = False
-            
-            # Check IP in the database
-
-            if 'ip' in self.threat_db and packet['src'] in self.threat_db["ip"]:
-                threat_info = self.threat_db["ip"][packet['src']]
-                report.append(f"Source IP {packet['src']} found in the threat database:")
-                report.append(f"  Type: {threat_info.get('type', 'Unspecified')}")
-                report.append(f"  Severity: {threat_info.get('severity', 'Unspecified')}")
-                report.append(f"  Description: {threat_info.get('description', 'No description available')}")
-                threat_found = True
-            
-            if 'ip' in self.threat_db and packet['dst'] in self.threat_db["ip"]:
-                threat_info = self.threat_db["ip"][packet['dst']]
-                report.append(f"Destination IP {packet['dst']} found in the threat database:")
-                report.append(f"  Type: {threat_info.get('type', 'Unspecified')}")
-                report.append(f"  Severity: {threat_info.get('severity', 'Unspecified')}")
-                report.append(f"  Description: {threat_info.get('description', 'No description available')}")
-                threat_found = True
-            
-            # Check doors in the database
-
-            if 'sport' in packet and 'ports' in self.threat_db and str(packet['sport']) in self.threat_db["ports"]:
-                port_info = self.threat_db["ports"][str(packet['sport'])]
-                report.append(f"Source port {packet['sport']} found in the threat database:")
-                report.append(f"  Type: {port_info.get('type', 'Unspecified')}")
-                report.append(f"  Severity: {port_info.get('severity', 'Unspecified')}")
-                report.append(f"  Description: {port_info.get('description', 'No description available')}")
-                threat_found = True
-            
-            if 'dport' in packet and 'ports' in self.threat_db and str(packet['dport']) in self.threat_db["ports"]:
-                port_info = self.threat_db["ports"][str(packet['dport'])]
-                report.append(f"Destination port {packet['dport']} found in the threat database:")
-                report.append(f"  Type: {port_info.get('type', 'Unspecified')}")
-                report.append(f"  Severity: {port_info.get('severity', 'Unspecified')}")
-                report.append(f"  Description: {port_info.get('description', 'No description available')}")
-                threat_found = True
-            
-            # Check patterns in the payload
-
-            if 'payload' in packet:
-                try:
-                    payload = packet['payload'].decode('latin-1', errors='ignore')
-                    for pattern in self.threat_db.get("patterns", []):
-                        if re.search(pattern["regex"], payload, re.IGNORECASE):
-                            report.append(f"Suspicious pattern found in the payload:")
-                            report.append(f"  Type: {pattern.get('type', 'Unspecified')}")
-                            report.append(f"  Severity: {pattern.get('severity', 'Unspecified')}")
-                            report.append(f"  Description: {pattern.get('description', 'No description available')}")
-                            
-                            # Find and report the corresponding text
-
-                            match = re.search(pattern["regex"], payload, re.IGNORECASE)
-                            if match:
-                                matched_text = match.group(0)
-                                report.append(f"  Pattern rilevato: '{matched_text}'")
-                            
-                            threat_found = True
-                except:
-                    pass
-            
-            if not threat_found:
-                report.append("No specific details available in the threat database.")
-            
-            report.append("")
-            
-            # Add Payload In Text format if available
-
-            if 'payload' in packet:
-                report.append("PAYLOAD (TEXT FORMAT)")
-                report.append("-" * 40)
-                try:
-                    payload_text = packet['payload'].decode('utf-8', errors='replace')
-                    # Limit the length to avoid huge files
-
-                    if len(payload_text) > 1000:
-                        payload_text = payload_text[:1000] + "... (troncato)"
-                    report.append(payload_text)
-                except:
-                    report.append("The payload could not be decoded as text.")
-                report.append("")
-            
-            # Add recommendations
-
-            report.append("RECOMMENDATIONS")
-            report.append("-" * 40)
-            
-            if "scan" in threat_type.lower() or "reconnaissance" in threat_type.lower():
-                report.append("1. Verify Firewall: Make sure your firewall is blocking unused ports correctly.")
-                report.append("2. Implement IDS/IPS: Consider implementing an intrusion detection/prevention system.")
-                report.append("3. Limit the information exposed: Minimize the information your servers expose.")
-                report.append("4. Monitor: Continues to monitor for persistent scan tasks.")
-            elif "malware" in threat_type.lower() or "virus" in threat_type.lower():
-                report.append("1. Isolate the system: Immediately disconnect the infected system from the network.")
-                report.append("2. Scan: Run a full scan with up-to-date antivirus software.")
-                report.append("3. Update: Make sure all systems are up to date with the latest security patches.")
-                report.append("4. Analyze: Examines system logs to identify how the infection occurred.")
-            elif "dos" in threat_type.lower() or "denial" in threat_type.lower():
-                report.append("1. Implement rate limiting: Configure your firewall or router to limit the number of connections.")
-                report.append("2. Use anti-DDoS services: Consider using specialized services to protect against DDoS attacks.")
-                report.append("3. Configure shorter timeouts: Reduce connection timeouts to free up resources faster.")
-                report.append("4. Increase capacity: If possible, temporarily increase server bandwidth or resources.")
-            elif "exploit" in threat_type.lower() or "vulnerability" in threat_type.lower():
-                report.append("1. Patch: Immediately update vulnerable software to the latest version.")
-                report.append("2. Implement WAF: Consider using a Web Application Firewall to protect web applications.")
-                report.append("3. Principle of least privilege: Ensure that all services run with the least privileges needed.")
-                report.append("4. Code audit: Perform regular code reviews to identify and fix vulnerabilities.")
+            # Generate report based on format
+            if file_ext == "html":
+                self._generate_html_report(file_path, packet, threat_type, severity)
+            elif file_ext == "json":
+                self._generate_json_report(file_path, packet, threat_type, severity)
             else:
-                report.append("1. Update systems and software: Keep all systems and applications up to date.")
-                report.append("2. Check your firewall and rules: Review your firewall rules and make sure that unauthorized access is blocked.")
-                report.append("3. Implement multi-factor authentication: Where possible, enable two-factor authentication.")
-                report.append("4. Monitor network traffic: Continue to monitor traffic to identify suspicious behavior.")
-                report.append("5. Run vulnerability scans: Regularly run vulnerability scans on your network.")
-            
-            # Add Footer
+                self._generate_text_report(file_path, packet, threat_type, severity)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Error creating report: {str(e)}")
 
-            report.append("")
-            report.append("=" * 80)
-            report.append("Report generated by Wiredigg")
-            report.append(f"Data: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            report.append("=" * 80)
-            # Use a secure way to write to file with proper error handling
+    def _generate_html_report(self, file_path, packet, threat_type, severity):
+        """Generate professional HTML report with AI analysis"""
+        
+        # Get AI analysis if available
+        ai_analysis = None
+        ai_recommendations = None
+        
+        if hasattr(self, 'ollama_validator') and hasattr(self, 'use_ollama') and self.use_ollama:
+            # Get comprehensive AI analysis
+            ai_prompt = f"""<role>
+    You are a cybersecurity expert creating a professional incident report.
+
+    Threat Information:
+    - Type: {threat_type}
+    - Severity: {severity}
+    - Source: {packet['src']}
+    - Destination: {packet['dst']}
+    - Protocol: {packet.get('proto_name', 'Unknown')}
+    - Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet['time']))}
+
+    Packet Details:
+    {json.dumps({k: str(v) for k, v in packet.items() if k not in ['payload', 'raw']}, indent=2)}
+    </role>
+
+    <task>
+    Create a comprehensive analysis including:
+    1. Executive Summary (2-3 sentences for management)
+    2. Technical Analysis (detailed findings)
+    3. Attack Timeline and Kill Chain Phase
+    4. Indicators of Compromise (IOCs)
+    5. Risk Assessment
+    6. Immediate Actions Required
+    7. Long-term Recommendations
+    8. MITRE ATT&CK Mapping
+    </task>
+
+    Format as JSON:
+    {{
+    "executive_summary": "brief summary for executives",
+    "technical_analysis": "detailed technical findings",
+    "attack_timeline": "timeline of events",
+    "kill_chain_phase": "reconnaissance|delivery|exploitation|installation|command_control|actions|exfiltration",
+    "iocs": {{"ips": [], "domains": [], "hashes": [], "patterns": []}},
+    "risk_assessment": {{"likelihood": "high|medium|low", "impact": "high|medium|low", "overall_risk": "critical|high|medium|low"}},
+    "immediate_actions": ["action1", "action2"],
+    "recommendations": ["rec1", "rec2"],
+    "mitre_attack": ["TXXXX", "TXXXX"]
+    }}"""
 
             try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(report))
+                response = requests.post(
+                    self.ollama_validator.api_endpoint,
+                    json={
+                        "model": self.ollama_validator.model_name,
+                        "prompt": ai_prompt,
+                        "stream": False,
+                        "format": "json"
+                    },
+                    timeout=45
+                )
                 
-                messagebox.showinfo("Export Complete", f"Report Successfully Saved To:\n{file_path}", parent=self.root)
-            except PermissionError:
-                messagebox.showerror("Error", f"Insufficient permissions to write to: {file_path}", parent=self.root)
-            except OSError as e:
-                messagebox.showerror("Error", f"I/O Error When Saving: {str(e)}", parent=self.root)
-            except Exception as e:
-                messagebox.showerror("Error", f"Unable to save report: {str(e)}", parent=self.root)
+                if response.status_code == 200:
+                    ai_analysis = json.loads(response.json().get('response', '{}'))
+            except:
+                pass
         
+        # Generate HTML
+        html_content = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Security Incident Report - {threat_type}</title>
+        <style>
+            body {{
+                font-family: 'Segoe UI', Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 30px;
+                box-shadow: 0 0 20px rgba(0,0,0,0.1);
+                border-radius: 8px;
+            }}
+            .header {{
+                border-bottom: 3px solid #2c3e50;
+                padding-bottom: 20px;
+                margin-bottom: 30px;
+            }}
+            h1 {{
+                color: #2c3e50;
+                margin: 0 0 10px 0;
+                font-size: 2.5em;
+            }}
+            .severity-badge {{
+                display: inline-block;
+                padding: 5px 15px;
+                border-radius: 20px;
+                font-weight: bold;
+                color: white;
+                font-size: 0.9em;
+            }}
+            .severity-critical {{ background-color: #e74c3c; }}
+            .severity-high {{ background-color: #e67e22; }}
+            .severity-medium {{ background-color: #f39c12; }}
+            .severity-low {{ background-color: #3498db; }}
+            .section {{
+                margin: 30px 0;
+                padding: 20px;
+                background-color: #f8f9fa;
+                border-radius: 5px;
+                border-left: 4px solid #3498db;
+            }}
+            .executive-summary {{
+                background-color: #ecf0f1;
+                border-left-color: #e74c3c;
+                font-size: 1.1em;
+            }}
+            .technical-details {{
+                font-family: 'Consolas', 'Courier New', monospace;
+                background-color: #2c3e50;
+                color: #ecf0f1;
+                padding: 15px;
+                border-radius: 5px;
+                overflow-x: auto;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+            }}
+            th, td {{
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }}
+            th {{
+                background-color: #34495e;
+                color: white;
+                font-weight: bold;
+            }}
+            tr:hover {{
+                background-color: #f5f5f5;
+            }}
+            .timeline {{
+                position: relative;
+                padding-left: 30px;
+            }}
+            .timeline-item {{
+                margin-bottom: 20px;
+                position: relative;
+            }}
+            .timeline-item::before {{
+                content: '';
+                position: absolute;
+                left: -25px;
+                top: 5px;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background-color: #3498db;
+            }}
+            .ioc-container {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+                margin: 20px 0;
+            }}
+            .ioc-box {{
+                background-color: #fff;
+                border: 1px solid #ddd;
+                padding: 15px;
+                border-radius: 5px;
+            }}
+            .recommendation {{
+                margin: 10px 0;
+                padding: 10px;
+                background-color: #e8f5e9;
+                border-left: 3px solid #4caf50;
+            }}
+            .immediate-action {{
+                background-color: #ffebee;
+                border-left-color: #f44336;
+                font-weight: bold;
+            }}
+            .footer {{
+                margin-top: 50px;
+                padding-top: 20px;
+                border-top: 1px solid #ddd;
+                text-align: center;
+                color: #7f8c8d;
+            }}
+            .risk-matrix {{
+                display: inline-block;
+                margin: 20px 0;
+            }}
+            .risk-cell {{
+                display: inline-block;
+                width: 100px;
+                height: 100px;
+                text-align: center;
+                line-height: 100px;
+                font-weight: bold;
+                color: white;
+            }}
+            .risk-critical {{ background-color: #8b0000; }}
+            .risk-high {{ background-color: #ff4500; }}
+            .risk-medium {{ background-color: #ffa500; }}
+            .risk-low {{ background-color: #32cd32; }}
+            @media print {{
+                body {{ background-color: white; }}
+                .container {{ box-shadow: none; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Security Incident Report</h1>
+                <p>
+                    <strong>Threat Type:</strong> {threat_type} | 
+                    <strong>Date:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')} | 
+                    <span class="severity-badge severity-{severity.lower()}">{severity} Severity</span>
+                </p>
+            </div>
+    """
+
+        # Executive Summary
+        if ai_analysis and ai_analysis.get('executive_summary'):
+            html_content += f"""
+            <div class="section executive-summary">
+                <h2>Executive Summary</h2>
+                <p>{ai_analysis['executive_summary']}</p>
+            </div>
+    """
+        
+        # Incident Details
+        html_content += f"""
+            <div class="section">
+                <h2>Incident Details</h2>
+                <table>
+                    <tr><th>Field</th><th>Value</th></tr>
+                    <tr><td>Timestamp</td><td>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet['time']))}</td></tr>
+                    <tr><td>Source IP</td><td>{packet['src']}</td></tr>
+                    <tr><td>Destination IP</td><td>{packet['dst']}</td></tr>
+                    <tr><td>Protocol</td><td>{packet.get('proto_name', 'Unknown')}</td></tr>
+                    <tr><td>Source Port</td><td>{packet.get('sport', 'N/A')}</td></tr>
+                    <tr><td>Destination Port</td><td>{packet.get('dport', 'N/A')}</td></tr>
+                    <tr><td>Packet Size</td><td>{packet.get('len', 0)} bytes</td></tr>
+                    <tr><td>TTL</td><td>{packet.get('ttl', 'N/A')}</td></tr>
+                </table>
+            </div>
+    """
+
+        # Technical Analysis
+        if ai_analysis and ai_analysis.get('technical_analysis'):
+            html_content += f"""
+            <div class="section">
+                <h2>Technical Analysis</h2>
+                <p>{ai_analysis['technical_analysis']}</p>
+            </div>
+    """
+
+        # Kill Chain Phase
+        if ai_analysis and ai_analysis.get('kill_chain_phase'):
+            html_content += f"""
+            <div class="section">
+                <h2>Cyber Kill Chain Analysis</h2>
+                <p><strong>Current Phase:</strong> {ai_analysis['kill_chain_phase'].replace('_', ' ').title()}</p>
+                <div class="timeline">
+    """
+            kill_chain_phases = [
+                'reconnaissance', 'weaponization', 'delivery', 'exploitation', 
+                'installation', 'command_control', 'actions_on_objectives'
+            ]
+            current_phase = ai_analysis['kill_chain_phase']
+            for phase in kill_chain_phases:
+                is_current = phase == current_phase
+                html_content += f"""
+                    <div class="timeline-item">
+                        <strong style="{'color: #e74c3c;' if is_current else ''}">{phase.replace('_', ' ').title()}</strong>
+                        {' ← Current Phase' if is_current else ''}
+                    </div>
+    """
+            html_content += """
+                </div>
+            </div>
+    """
+
+        # Risk Assessment
+        if ai_analysis and ai_analysis.get('risk_assessment'):
+            risk = ai_analysis['risk_assessment']
+            html_content += f"""
+            <div class="section">
+                <h2>Risk Assessment</h2>
+                <p><strong>Likelihood:</strong> {risk.get('likelihood', 'Unknown').title()}</p>
+                <p><strong>Impact:</strong> {risk.get('impact', 'Unknown').title()}</p>
+                <p><strong>Overall Risk Level:</strong> <span class="severity-badge severity-{risk.get('overall_risk', 'medium')}">{risk.get('overall_risk', 'Unknown').upper()}</span></p>
+            </div>
+    """
+
+        # IOCs
+        if ai_analysis and ai_analysis.get('iocs'):
+            iocs = ai_analysis['iocs']
+            html_content += """
+            <div class="section">
+                <h2>Indicators of Compromise (IOCs)</h2>
+                <div class="ioc-container">
+    """
+            if iocs.get('ips'):
+                html_content += f"""
+                    <div class="ioc-box">
+                        <h3>IP Addresses</h3>
+                        <ul>{''.join(f'<li>{ip}</li>' for ip in iocs['ips'])}</ul>
+                    </div>
+    """
+            if iocs.get('domains'):
+                html_content += f"""
+                    <div class="ioc-box">
+                        <h3>Domains</h3>
+                        <ul>{''.join(f'<li>{domain}</li>' for domain in iocs['domains'])}</ul>
+                    </div>
+    """
+            if iocs.get('patterns'):
+                html_content += f"""
+                    <div class="ioc-box">
+                        <h3>Patterns/Signatures</h3>
+                        <ul>{''.join(f'<li>{pattern}</li>' for pattern in iocs['patterns'])}</ul>
+                    </div>
+    """
+            html_content += """
+                </div>
+            </div>
+    """
+
+        # Recommendations
+        if ai_analysis:
+            html_content += """
+            <div class="section">
+                <h2>Recommendations</h2>
+    """
+            if ai_analysis.get('immediate_actions'):
+                html_content += """
+                <h3>Immediate Actions Required</h3>
+    """
+                for action in ai_analysis['immediate_actions']:
+                    html_content += f"""
+                <div class="recommendation immediate-action">
+                    {action}
+                </div>
+    """
+            
+            if ai_analysis.get('recommendations'):
+                html_content += """
+                <h3>Long-term Recommendations</h3>
+    """
+                for rec in ai_analysis['recommendations']:
+                    html_content += f"""
+                <div class="recommendation">
+                    {rec}
+                </div>
+    """
+            html_content += """
+            </div>
+    """
+
+        # MITRE ATT&CK
+        if ai_analysis and ai_analysis.get('mitre_attack'):
+            html_content += f"""
+            <div class="section">
+                <h2>MITRE ATT&CK Mapping</h2>
+                <p>This incident maps to the following MITRE ATT&CK techniques:</p>
+                <ul>
+                    {''.join(f'<li><a href="https://attack.mitre.org/techniques/{tid}/" target="_blank">{tid}</a></li>' for tid in ai_analysis['mitre_attack'])}
+                </ul>
+            </div>
+    """
+
+        # Packet Payload (if exists)
+        if packet.get('payload'):
+            html_content += """
+            <div class="section">
+                <h2>Packet Payload Analysis</h2>
+                <div class="technical-details">
+    """
+            # Show hex dump
+            payload = packet['payload']
+            hex_lines = []
+            for i in range(0, len(payload), 16):
+                hex_part = ' '.join(f'{b:02x}' for b in payload[i:i+16])
+                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in payload[i:i+16])
+                hex_lines.append(f"{i:04x}  {hex_part:<48}  |{ascii_part}|")
+            
+            html_content += '\n'.join(hex_lines[:20])  # Limit to first 20 lines
+            if len(hex_lines) > 20:
+                html_content += f"\n... ({len(hex_lines) - 20} more lines)"
+            
+            html_content += """
+                </div>
+            </div>
+    """
+
+        # Footer
+        html_content += f"""
+            <div class="footer">
+                <p>Report generated by Wiredigg Security Analyzer</p>
+                <p>Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                <p>Report ID: {packet.get('time', 0)}-{hash(str(packet)) % 10000:04d}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+        # Save file
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            messagebox.showinfo("Export Complete", f"Professional report saved to:\n{file_path}")
         except Exception as e:
-            messagebox.showerror("Error", f" Error creating report: {str(e)}", parent=self.root)
+            messagebox.showerror("Error", f"Failed to save report: {str(e)}")
+
+    def _generate_json_report(self, file_path, packet, threat_type, severity):
+        """Generate technical JSON report"""
+        
+        # Prepare packet data (convert bytes to hex strings)
+        packet_data = {}
+        for k, v in packet.items():
+            if isinstance(v, bytes):
+                packet_data[k] = v.hex()
+            else:
+                packet_data[k] = v
+        
+        # Create report structure
+        report = {
+            "metadata": {
+                "report_type": "threat_analysis",
+                "generated_at": time.strftime('%Y-%m-%dT%H:%M:%S'),
+                "generator": "Wiredigg Security Analyzer",
+                "version": "1.0"
+            },
+            "incident": {
+                "threat_type": threat_type,
+                "severity": severity,
+                "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(packet['time'])),
+                "packet_id": hash(str(packet)) % 1000000
+            },
+            "packet_details": packet_data,
+            "network_flow": {
+                "source": {
+                    "ip": packet.get('src'),
+                    "port": packet.get('sport'),
+                    "mac": packet.get('src_mac', 'unknown')
+                },
+                "destination": {
+                    "ip": packet.get('dst'),
+                    "port": packet.get('dport'),
+                    "mac": packet.get('dst_mac', 'unknown')
+                },
+                "protocol": packet.get('proto_name')
+            }
+        }
+        
+        # Add AI analysis if available
+        if hasattr(self, 'ollama_validator') and hasattr(self, 'use_ollama') and self.use_ollama:
+            try:
+                # Get structured analysis
+                analysis_prompt = f"""Analyze this security incident and provide structured data:
+    Threat: {threat_type}
+    Severity: {severity}
+    Source: {packet.get('src')}:{packet.get('sport')}
+    Destination: {packet.get('dst')}:{packet.get('dport')}
+
+    Provide analysis as JSON with: threat_indicators, attack_vectors, remediation_steps, risk_score (0-100)"""
+                
+                response = requests.post(
+                    self.ollama_validator.api_endpoint,
+                    json={
+                        "model": self.ollama_validator.model_name,
+                        "prompt": analysis_prompt,
+                        "stream": False,
+                        "format": "json"
+                    },
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    ai_analysis = json.loads(response.json().get('response', '{}'))
+                    report['ai_analysis'] = ai_analysis
+            except:
+                pass
+        
+        # Save JSON
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(report, f, indent=2)
+            messagebox.showinfo("Export Complete", f"JSON report saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save report: {str(e)}")
+
+    def _generate_text_report(self, file_path, packet, threat_type, severity):
+        """Generate enhanced text report with AI analysis"""
+        
+        report = []
+        report.append("=" * 80)
+        report.append(f"PROFESSIONAL SECURITY INCIDENT REPORT")
+        report.append("=" * 80)
+        report.append("")
+        report.append(f"Report Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append(f"Incident Type: {threat_type}")
+        report.append(f"Severity Level: {severity}")
+        report.append(f"Report ID: {packet.get('time', 0)}-{hash(str(packet)) % 10000:04d}")
+        report.append("")
+        
+        # Get AI analysis
+        if hasattr(self, 'ollama_validator') and hasattr(self, 'use_ollama') and self.use_ollama:
+            report.append("AI-ENHANCED ANALYSIS")
+            report.append("-" * 40)
+            
+            try:
+                analysis_prompt = f"""Provide a comprehensive security analysis for this incident:
+    Threat Type: {threat_type}
+    Severity: {severity}
+    Source: {packet['src']}:{packet.get('sport', 'N/A')}
+    Destination: {packet['dst']}:{packet.get('dport', 'N/A')}
+    Protocol: {packet.get('proto_name', 'Unknown')}
+
+    Include: summary, technical details, risk assessment, and actionable recommendations."""
+                
+                response = requests.post(
+                    self.ollama_validator.api_endpoint,
+                    json={
+                        "model": self.ollama_validator.model_name,
+                        "prompt": analysis_prompt,
+                        "stream": False
+                    },
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    ai_text = response.json().get('response', 'Analysis unavailable')
+                    report.append(ai_text)
+                    report.append("")
+            except:
+                report.append("AI analysis unavailable")
+                report.append("")
+        
+        # Network Flow Details
+        report.append("NETWORK FLOW DETAILS")
+        report.append("-" * 40)
+        report.append(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet['time']))}")
+        report.append(f"Source: {packet['src']}:{packet.get('sport', 'N/A')}")
+        report.append(f"Destination: {packet['dst']}:{packet.get('dport', 'N/A')}")
+        report.append(f"Protocol: {packet.get('proto_name', 'Unknown')}")
+        report.append(f"Packet Size: {packet.get('len', 0)} bytes")
+        report.append(f"TTL: {packet.get('ttl', 'N/A')}")
+        report.append("")
+        
+        # Threat Intelligence
+        report.append("THREAT INTELLIGENCE")
+        report.append("-" * 40)
+        
+        # Check against threat DB
+        threat_found = False
+        if hasattr(self, 'threat_db'):
+            if 'ip' in self.threat_db and packet['src'] in self.threat_db['ip']:
+                info = self.threat_db['ip'][packet['src']]
+                report.append(f"Source IP {packet['src']} - KNOWN THREAT")
+                report.append(f"  Classification: {info.get('type', 'Unknown')}")
+                report.append(f"  Risk Level: {info.get('severity', 'Unknown')}")
+                report.append(f"  Details: {info.get('description', 'No details')}")
+                threat_found = True
+        
+        if not threat_found:
+            report.append("No specific threat intelligence available")
+        report.append("")
+        
+        # Payload Analysis
+        if packet.get('payload'):
+            report.append("PAYLOAD ANALYSIS")
+            report.append("-" * 40)
+            payload = packet['payload']
+            
+            # ASCII strings
+            ascii_strings = []
+            current = ""
+            for b in payload:
+                if 32 <= b < 127:
+                    current += chr(b)
+                else:
+                    if len(current) >= 4:
+                        ascii_strings.append(current)
+                    current = ""
+            
+            if ascii_strings:
+                report.append("Extracted strings:")
+                for s in ascii_strings[:10]:  # Limit to first 10
+                    report.append(f"  - {s}")
+            
+            # Hex dump (first 256 bytes)
+            report.append("")
+            report.append("Hex dump (first 256 bytes):")
+            for i in range(0, min(256, len(payload)), 16):
+                hex_part = ' '.join(f'{b:02x}' for b in payload[i:i+16])
+                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in payload[i:i+16])
+                report.append(f"{i:04x}  {hex_part:<48}  |{ascii_part}|")
+            report.append("")
+        
+        # Recommendations
+        report.append("INCIDENT RESPONSE RECOMMENDATIONS")
+        report.append("-" * 40)
+        
+        # Severity-based recommendations
+        if severity == "Critical" or severity == "High":
+            report.append("IMMEDIATE ACTIONS REQUIRED:")
+            report.append("1. Isolate affected systems immediately")
+            report.append("2. Initiate incident response protocol")
+            report.append("3. Preserve evidence for forensic analysis")
+            report.append("4. Check for lateral movement indicators")
+            report.append("5. Review logs for related activity")
+        elif severity == "Medium":
+            report.append("RECOMMENDED ACTIONS (24-48 hours):")
+            report.append("1. Investigate the source and destination")
+            report.append("2. Review firewall rules")
+            report.append("3. Check for repeated patterns")
+            report.append("4. Update security signatures")
+        else:
+            report.append("MONITORING RECOMMENDATIONS:")
+            report.append("1. Log for correlation analysis")
+            report.append("2. Monitor for pattern escalation")
+            report.append("3. Review during next security audit")
+        
+        report.append("")
+        report.append("=" * 80)
+        report.append("End of Report - Wiredigg Security Analyzer")
+        report.append("=" * 80)
+        
+        # Save report
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(report))
+            messagebox.showinfo("Export Complete", f"Report saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save report: {str(e)}")
 
     def generate_predictions(self):
         """Generate network traffic forecasts with advanced statistical methods"""
