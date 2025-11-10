@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="wiredigg.png" alt="PolymCP Logo" width="400"/>
+  <img src="wiredigg.png" alt="Logo" width="800"/>
 </p>
 
 
